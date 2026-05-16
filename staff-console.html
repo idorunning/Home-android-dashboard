@@ -726,10 +726,40 @@ async function idbAllKeys(){
   });
 }
 
+// Garbage-collect orphan blobs: any IndexedDB entry not referenced by the current
+// store (logo, staff photos, file attachments). Without this, removing staff or
+// restoring a backup leaks blobs forever. Best-effort and non-blocking.
+async function gcBlobs(store){
+  try {
+    const keep = new Set();
+    if (store.settings && store.settings.logoId) keep.add(store.settings.logoId);
+    (store.staff || []).forEach(s => { if (s.photoId) keep.add(s.photoId); });
+    (store.files || []).forEach(f => { if (f.id) keep.add(f.id); });
+    const keys = await idbAllKeys();
+    for (const k of keys) { if (!keep.has(k)) { try { await idbDelete(k); } catch(e){} } }
+  } catch(e){ /* IndexedDB unavailable — nothing to collect */ }
+}
+
 /* =========================================================================
    UTILITIES
    ========================================================================= */
 const uid = (p="id") => `${p}_${Math.random().toString(36).slice(2,9)}${Date.now().toString(36).slice(-4)}`;
+
+// Escape untrusted text before it goes into raw innerHTML (Leaflet popups/labels).
+// Staff data can come from spreadsheet import, so a name like `<img onerror=…>`
+// would otherwise be a stored-XSS vector.
+function escapeHtml(v){
+  return String(v == null ? "" : v)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+// Deterministic [0,1) hash from a string — stable per id so jittered map dots
+// don't jump around on every re-render.
+function hashUnit(str){
+  let h = 2166136261;
+  for (let i = 0; i < String(str).length; i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return ((h >>> 0) % 100000) / 100000;
+}
 
 const fmt = {
   date: iso => {
@@ -770,9 +800,13 @@ function addMonths(isoDate, n){
   return d.toISOString();
 }
 function startOfDayIso(){
+  // Local midnight with NO timezone suffix. `new Date()` parses this back as local
+  // time, and `.slice(0,10)` yields the local calendar date. The old version used
+  // `toISOString()`, which converts local midnight to UTC and — under BST (most of
+  // the UK year) — slices to the *previous* day, mis-counting "due today".
   const d = new Date();
-  d.setHours(0,0,0,0);
-  return d.toISOString();
+  const pad = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T00:00:00`;
 }
 function advanceDue(dueIso, rec){
   if (!rec || !rec.type || rec.type === "none") return null;
@@ -859,14 +893,15 @@ function parseSheetDate(v){
   return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-// Split "Surname, FORENAME" or "Forename SURNAME" into {firstName, lastName}
+// Split "SURNAME, Forename" or "Forename SURNAME" into {firstName, lastName}
 function splitOfficerName(raw){
   if (!raw) return { firstName: "", lastName: "" };
   const s = String(raw).trim();
   if (s.includes(",")) {
-    // The sheet uses "Forename, SURNAME" — first part is forename
-    const [a, b] = s.split(",").map(x => x.trim());
-    return { firstName: a || "", lastName: b || "" };
+    // Police rosters use "SURNAME, Forename" — the part before the comma is the
+    // surname. (The previous code mapped it the other way round, swapping names.)
+    const [surname, forename] = s.split(",").map(x => x.trim());
+    return { firstName: forename || "", lastName: surname || "" };
   }
   const parts = s.split(/\s+/);
   if (parts.length === 1) return { firstName: parts[0], lastName: "" };
@@ -877,6 +912,7 @@ function splitOfficerName(raw){
 function parseEsectionRows(rows){
   const people = [];
   let header = null;       // current header field map: colIndex -> fieldKey
+  let present = new Set(); // canonical field keys present in the current header block
   for (let r = 0; r < rows.length; r++){
     const row = rows[r] || [];
     const firstCell = (row[0] == null ? "" : String(row[0])).trim().toLowerCase();
@@ -888,6 +924,7 @@ function parseEsectionRows(rows){
         const key = HEADER_MAP[(cell == null ? "" : String(cell)).trim().toLowerCase()];
         if (key) header[ci] = key;
       });
+      present = new Set(Object.values(header));
       continue;
     }
 
@@ -897,8 +934,10 @@ function parseEsectionRows(rows){
 
     if (!header) continue;  // data before any header — skip
 
-    // Build a record from this row
-    const rec = { capabilities: blankCapabilities() };
+    // Build a record from this row. Capabilities only carry the keys whose columns
+    // were actually present, so a sheet without capability columns never wipes
+    // existing capability data on update (see applyImport).
+    const rec = { capabilities: {} };
     Object.entries(header).forEach(([ci, key]) => {
       const val = row[ci];
       if (key.startsWith("cap_")) {
@@ -943,7 +982,10 @@ function parseEsectionRows(rows){
       startedDate: parseSheetDate(rec.startedDate),
       endDate: parseSheetDate(rec.endDate),
       capabilities: rec.capabilities,
-      note: rec.note || ""
+      note: rec.note || "",
+      // Which spreadsheet columns this row actually came from — so an import that
+      // omits a column leaves that field untouched rather than blanking it.
+      _present: Array.from(present)
     });
   }
   return people;
@@ -1023,6 +1065,19 @@ function StoreProvider({ children }){
     setSaveState(s => ({ ...s, ...result }));
   }, [store]);
 
+  // Garbage-collect orphan IndexedDB blobs whenever the set of referenced blob ids
+  // changes (staff removed, backup restored, photo/logo replaced). Debounced so a
+  // burst of edits only triggers one sweep; runs once on mount too.
+  const blobSig = [
+    store.settings.logoId || "",
+    ...store.staff.map(s => s.photoId || ""),
+    ...store.files.map(f => f.id)
+  ].join("|");
+  React.useEffect(() => {
+    const t = setTimeout(() => { gcBlobs(store); }, 3000);
+    return () => clearTimeout(t);
+  }, [blobSig]);
+
   // Theme application
   React.useEffect(() => {
     const root = document.documentElement;
@@ -1056,18 +1111,20 @@ function StoreProvider({ children }){
     store, setStore, saveState,
 
     // STAFF
-    addStaff: (s) => setStore(p => ({ ...p, staff: [...p.staff, { id: uid("stf"), createdAt: new Date().toISOString(), tags:[], ...s }] })),
+    addStaff: (s) => setStore(p => ({ ...p, staff: [...p.staff, { id: uid("stf"), createdAt: new Date().toISOString(), tags:[], inLatestImport: true, ...s }] })),
     addStaffBulk: (arr) => setStore(p => ({
       ...p,
-      staff: [...p.staff, ...arr.map(s => ({ id: uid("stf"), createdAt: new Date().toISOString(), tags:[], status: "Active", ...s }))]
+      staff: [...p.staff, ...arr.map(s => ({ id: uid("stf"), createdAt: new Date().toISOString(), tags:[], status: "Active", inLatestImport: true, ...s }))]
     })),
     updateStaff: (id, patch) => setStore(p => ({ ...p, staff: p.staff.map(s => s.id===id ? { ...s, ...patch } : s) })),
     removeStaff: (id) => setStore(p => ({
       ...p,
       staff: p.staff.filter(s => s.id !== id),
-      tasks: p.tasks
-        .filter(t => t.assigneeId !== id || t.isChaser)
-        .map(t => t.isChaser ? { ...t, assigneeIds: (t.assigneeIds || []).filter(aid => aid !== id) } : t),
+      // Keep tasks — just unassign them (a task can still matter after the person
+      // leaves; silently deleting it loses work). Chasers drop the id from the list.
+      tasks: p.tasks.map(t => t.isChaser
+        ? { ...t, assigneeIds: (t.assigneeIds || []).filter(aid => aid !== id) }
+        : (t.assigneeId === id ? { ...t, assigneeId: "" } : t)),
       files: p.files.filter(f => !(f.scope === "officer" && f.scopeId === id))
     })),
 
@@ -1112,25 +1169,30 @@ function StoreProvider({ children }){
       // Mark everyone not in this import
       const inImport = new Set();
 
-      // Updates — merge spreadsheet fields onto existing records, keep dashboard-only fields
+      // Updates — merge spreadsheet fields onto existing records, keep dashboard-only
+      // fields. Only override a field if its column was actually present in the
+      // sheet, so a partial export never silently blanks acting/resigned/restriction.
       diff.updated.forEach(u => {
         inImport.add(u.id);
+        const cols = new Set(u.after._present || []);
+        const has = k => cols.has(k);
+        const hasRestriction = has("restrictionType") || has("restrictionEnd");
         staff = staff.map(s => s.id === u.id ? {
           ...s,
           firstName: u.after.firstName || s.firstName,
           lastName:  u.after.lastName  || s.lastName,
           name:      u.after.name      || s.name,
-          warrantNumber: u.after.warrantNumber || s.warrantNumber,
-          role:      u.after.role      || s.role,
-          team:      u.after.team      || s.team,
-          hub:       u.after.hub       || s.hub,
-          acting:    u.after.acting != null ? u.after.acting : s.acting,
-          resigned:  u.after.resigned != null ? u.after.resigned : s.resigned,
-          restriction: u.after.restriction !== undefined ? u.after.restriction : s.restriction,
-          startedDate: u.after.startedDate != null ? u.after.startedDate : s.startedDate,
-          endDate:   u.after.endDate != null ? u.after.endDate : s.endDate,
+          warrantNumber: has("warrantNumber") ? (u.after.warrantNumber || s.warrantNumber) : s.warrantNumber,
+          role:      has("role") ? (u.after.role || s.role) : s.role,
+          team:      has("team") ? (u.after.team || s.team) : s.team,
+          hub:       has("hub")  ? (u.after.hub  || s.hub)  : s.hub,
+          acting:    has("acting")   ? u.after.acting   : s.acting,
+          resigned:  has("resigned") ? u.after.resigned : s.resigned,
+          restriction: hasRestriction ? u.after.restriction : s.restriction,
+          startedDate: has("startedDate") && u.after.startedDate != null ? u.after.startedDate : s.startedDate,
+          endDate:   has("endDate") && u.after.endDate != null ? u.after.endDate : s.endDate,
           capabilities: { ...blankCapabilities(), ...s.capabilities, ...u.after.capabilities },
-          note:      u.after.note != null && u.after.note !== "" ? u.after.note : s.note,
+          note:      has("note") && u.after.note != null && u.after.note !== "" ? u.after.note : s.note,
           inLatestImport: true
         } : s);
       });
@@ -1139,9 +1201,10 @@ function StoreProvider({ children }){
       const addedRecords = diff.added.map(a => {
         const id = uid("stf");
         inImport.add(id);
+        const { _present, ...clean } = a;   // drop the import-only column marker
         return upgradeStaff({
           id, createdAt: now, tags: [], status: "Active",
-          ...a, inLatestImport: true
+          ...clean, inLatestImport: true
         });
       });
       staff = [...staff, ...addedRecords];
@@ -1492,6 +1555,14 @@ const RESTRICTION_TONE = {
   "Restricted/Suspended": "rose"
 };
 const PRIO_TONE = { high: "rose", medium: "amber", low: "neutral" };
+// Stable pill tone for a team, derived from its position in the configured team
+// list so renamed/extra teams (e.g. "Patrol"/"CID") still get a consistent colour
+// instead of the old hard-coded Response/Investigations check.
+const TEAM_TONES = ["sky", "violet", "teal", "amber", "brand", "rose"];
+function teamTone(team, teams){
+  const i = (teams || TEAMS).indexOf(team);
+  return i < 0 ? "neutral" : TEAM_TONES[i % TEAM_TONES.length];
+}
 
 function StatusBadge({ value }){
   return <Pill tone={STATUS_TONE[value] || "neutral"}>{value}</Pill>;
@@ -1665,7 +1736,7 @@ const NAV = [
   { id: "overview",     label: "Overview",        icon: Ic.overview },
   { id: "staff",        label: "Staff",           icon: Ic.staff },
   { id: "tasks",        label: "Tasks",           icon: Ic.task },
-  { id: "capabilities", label: "Training/Skills", icon: Ic.shield },
+  { id: "capabilities", label: "Skills", icon: Ic.shield },
   { id: "map",          label: "Map",             icon: Ic.map },
   { id: "files",        label: "Files",           icon: Ic.folder },
   { id: "import",       label: "Import",          icon: Ic.upload },
@@ -1730,7 +1801,7 @@ function Sidebar({ active, onNav, collapsed, onToggleCollapse }){
 const VIEW_META = {
   overview:     { title: "Overview",              subtitle: "" },   // overview shows the live date instead
   staff:        { title: "Staff",                 subtitle: "Filter by hub, team, role, status or restriction" },
-  capabilities: { title: "Training/Skills",       subtitle: "Operational capabilities and skills across the team" },
+  capabilities: { title: "Skills",                subtitle: "Operational capabilities and skills across the team" },
   map:          { title: "Map",                   subtitle: "Hub deployment view" },
   tasks:        { title: "Tasks and chasers",     subtitle: "What needs your attention, and follow-ups to remember" },
   files:        { title: "Files",                 subtitle: "Documents organised by officer, team and global" },
@@ -2338,7 +2409,7 @@ function StaffView({ query }){
                               <div className="font-semibold text-ink-900 dark:text-ink-100 flex items-center gap-1.5">
                                 <StaffNameLink staff={s}/>
                                 {s.resigned && <Pill tone="rose">Resigned / moved</Pill>}
-                                {!s.inLatestImport && <Pill tone="amber">Not in import</Pill>}
+                                {s.inLatestImport === false && <Pill tone="amber">Not in import</Pill>}
                               </div>
                               <div className="text-[11.5px] text-ink-500 font-mono">{s.warrantNumber || "—"}</div>
                             </div>
@@ -2418,7 +2489,7 @@ function EmptyDetail(){
           <Ic.staff width="24" height="24"/>
         </div>
         <div className="text-[14px] font-semibold text-ink-700 dark:text-ink-300 mb-1">Pick someone</div>
-        <div className="text-[12.5px] text-ink-500">Click any row to see their full profile, tasks, and training records.</div>
+        <div className="text-[12.5px] text-ink-500">Click any row to see their full profile, tasks, and files.</div>
       </div>
     </Card>
   );
@@ -2474,11 +2545,11 @@ function StaffDetail({ staff, onEdit, onRemove, onClose }){
         <StatusBadge value={staff.status}/>
       </div>
 
-      {(staff.resigned || !staff.inLatestImport || (staff.restriction && staff.restriction.type)) && (
+      {(staff.resigned || staff.inLatestImport === false || (staff.restriction && staff.restriction.type)) && (
         <div className="flex flex-wrap gap-1.5 mb-4">
           {staff.resigned    && <Pill tone="rose">Resigned / moved team</Pill>}
           {staff.restriction && staff.restriction.type && <RestrictionBadge restriction={staff.restriction}/>}
-          {!staff.inLatestImport && <Pill tone="amber">Not in latest import</Pill>}
+          {staff.inLatestImport === false && <Pill tone="amber">Not in latest import</Pill>}
         </div>
       )}
 
@@ -2650,7 +2721,8 @@ function StaffForm({ staff, onSave, onCancel }){
   });
   const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
   const setCap = (k, v) => setForm(p => ({ ...p, capabilities: { ...p.capabilities, [k]: v } }));
-  const valid = (form.firstName.trim() + form.lastName.trim()).length > 0;
+  const emailOk = validateEmail(form.email);
+  const valid = (form.firstName.trim() + form.lastName.trim()).length > 0 && emailOk;
 
   // Photo upload — reads the file, stashes it in IndexedDB under a generated id, and
   // saves the id on the staff record. The blob never goes near localStorage.
@@ -2745,6 +2817,7 @@ function StaffForm({ staff, onSave, onCancel }){
                 if (fn && ln) set("email", `${fn}.${ln}@sussex.police.uk`);
               }}>From name</Button>
             </div>
+            {!emailOk && <div className="text-[11px] text-rose-500 mt-1" role="alert">That doesn’t look like a valid email address.</div>}
             <div className="text-[11px] text-ink-500 mt-1">Auto-generated as firstname.lastname@sussex.police.uk — amend for hyphenated names, transfers, or any oddities.</div>
           </Field>
         </div>
@@ -3027,8 +3100,20 @@ function MapView(){
     Littlehampton: { lat: 50.8118, lng: -0.5413, color: "#E89A1C" }
   };
   const archivedHubs = settings.archivedHubs || [];
-  // Only plot active hubs that we have coordinates for
-  const activeHubs = (settings.hubs || HUBS).filter(h => !archivedHubs.includes(h) && HUB_CENTRES[h]);
+  // Show every active hub. Hubs we don't have coordinates for (custom ones added
+  // in Settings) used to silently vanish from the map — instead give them a
+  // deterministic approximate centre so their staff still appear.
+  const activeHubs = (settings.hubs || HUBS).filter(h => !archivedHubs.includes(h));
+  const centreFor = (hub) => {
+    if (HUB_CENTRES[hub]) return { ...HUB_CENTRES[hub], approx: false };
+    const u = hashUnit(hub);
+    return {
+      lat: 50.86 + (u - 0.5) * 0.30,
+      lng: -0.50 + (hashUnit(hub + "x") - 0.5) * 0.60,
+      color: CHART_PALETTE[Math.floor(u * CHART_PALETTE.length) % CHART_PALETTE.length],
+      approx: true
+    };
+  };
 
   // Staff grouped by hub (active hubs only)
   const byHub = React.useMemo(() => {
@@ -3059,7 +3144,7 @@ function MapView(){
     const g = layerRef.current;
 
     activeHubs.forEach(hub => {
-      const c = HUB_CENTRES[hub];
+      const c = centreFor(hub);
       const list = byHub[hub] || [];
       L.circle([c.lat, c.lng], {
         radius: 1400 + list.length * 110,
@@ -3072,27 +3157,37 @@ function MapView(){
             ${list.length}
           </div>
           <div style="margin-top:4px;background:#fff;border-radius:8px;padding:2px 8px;font-family:'Carlito',sans-serif;font-weight:600;font-size:11px;color:#0F1320;box-shadow:0 2px 6px rgba(15,19,32,.10);">
-            ${hub}
+            ${escapeHtml(hub)}${c.approx ? " (approx)" : ""}
           </div>
         </div>`;
       L.marker([c.lat, c.lng], { icon: L.divIcon({ html, className: "", iconSize: [60, 60], iconAnchor: [30, 30] }) }).addTo(g);
 
+      // Plot one dot per officer. Real coordinates are used when present; otherwise
+      // the officer is scattered deterministically around the hub centre so that
+      // imported / manually-added staff (which never carry lat/lng) still appear.
       list.forEach(s => {
-        if (!s.lat || !s.lng) return;
-        const dot = L.circleMarker([s.lat, s.lng], {
+        let lat = s.lat, lng = s.lng;
+        if (lat == null || lng == null) {
+          const a = hashUnit(s.id) * 2 * Math.PI;
+          const r = 0.004 + hashUnit(s.id + "r") * 0.018;
+          lat = c.lat + Math.sin(a) * r;
+          lng = c.lng + Math.cos(a) * r * 1.5;
+        }
+        const dot = L.circleMarker([lat, lng], {
           radius: 6, color: "white", weight: 2, fillColor: c.color, fillOpacity: 0.95
         }).addTo(g);
         const pop = `<div style="font-family:'Carlito',sans-serif;font-size:12.5px;min-width:160px;">
-                       <div style="font-weight:700;color:#0F1320;">${s.name}</div>
-                       <div style="color:#6B7180;font-size:11.5px;margin-top:2px;">${s.role}${s.warrantNumber ? " · " + s.warrantNumber : ""}</div>
-                       <div style="color:#5765E0;font-size:11.5px;margin-top:4px;">${s.team || ""}${s.acting ? " · Acting Sgt" : ""}</div>
+                       <div style="font-weight:700;color:#0F1320;">${escapeHtml(s.name)}</div>
+                       <div style="color:#6B7180;font-size:11.5px;margin-top:2px;">${escapeHtml(s.role)}${s.warrantNumber ? " · " + escapeHtml(s.warrantNumber) : ""}</div>
+                       <div style="color:#5765E0;font-size:11.5px;margin-top:4px;">${escapeHtml(s.team || "")}${s.acting ? " · Acting Sgt" : ""}</div>
                      </div>`;
         dot.bindPopup(pop);
       });
     });
 
-    if (focus !== "all" && HUB_CENTRES[focus]) {
-      mapObj.current.flyTo([HUB_CENTRES[focus].lat, HUB_CENTRES[focus].lng], 12);
+    if (focus !== "all" && activeHubs.includes(focus)) {
+      const fc = centreFor(focus);
+      mapObj.current.flyTo([fc.lat, fc.lng], 12);
     } else {
       mapObj.current.flyTo([50.86, -0.5], 10);
     }
@@ -3117,7 +3212,7 @@ function MapView(){
           <Card>
             <div className="grid grid-cols-2 gap-3">
               {activeHubs.map(hub => {
-                const c = HUB_CENTRES[hub];
+                const c = centreFor(hub);
                 return (
                   <button key={hub} onClick={() => setFocus(hub)} className="text-left p-4 rounded-xl bg-canvas dark:bg-ink-900/40 hover:bg-card transition">
                     <div className="text-[11px] text-ink-500 uppercase tracking-wider mb-1">{hub}</div>
@@ -3900,7 +3995,7 @@ function CapabilitiesView(){
 
       {/* Filters */}
       <div className="flex items-center gap-2 mb-5 flex-wrap">
-        {[["all","All teams"],["Response","Response"],["Investigations","Investigations"]].map(([id,label]) => (
+        {[["all","All teams"], ...(settings.teams || TEAMS).map(t => [t, t])].map(([id,label]) => (
           <button key={id} onClick={() => setTeamFilter(id)}
                   className={`px-4 py-2 rounded-xl text-[13px] font-semibold transition ${teamFilter === id ? "bg-brand-500 text-white shadow-sm" : "bg-card border border-softline text-ink-700 dark:text-ink-300 dark:border-ink-800 hover:border-brand-300"}`}>
             {label}
@@ -3948,7 +4043,7 @@ function CapabilitiesView(){
                   </td>
                   <td className="px-2 py-2">
                     <div className="flex items-center gap-1.5">
-                      <Pill tone={s.team === "Investigations" ? "violet" : "sky"}>{s.team}</Pill>
+                      <Pill tone={teamTone(s.team, settings.teams)}>{s.team}</Pill>
                       <span className="text-[11px] text-ink-500">{s.hub}</span>
                     </div>
                   </td>
@@ -4025,17 +4120,22 @@ function ImportView({ onNav }){
   // Build a per-row change summary for the review table
   const fieldChanges = (before, after) => {
     const changes = [];
+    // Only diff a field if its column was present in the sheet — otherwise an
+    // omitted column would look like a change to "—" when nothing is changing.
+    const cols = new Set(after._present || []);
+    const has = k => cols.has(k);
     const cmp = (label, b, a) => { if ((b || "") !== (a || "") && a) changes.push(`${label}: ${b || "—"} → ${a}`); };
-    cmp("Warrant", before.warrantNumber, after.warrantNumber);
-    cmp("Role", before.role, after.role);
-    cmp("Team", before.team, after.team);
-    cmp("Hub", before.hub, after.hub);
-    if (before.acting !== after.acting) changes.push(`Acting: ${before.acting ? "yes" : "no"} → ${after.acting ? "yes" : "no"}`);
-    if (before.resigned !== after.resigned) changes.push(`Resigned/moved: ${before.resigned ? "yes" : "no"} → ${after.resigned ? "yes" : "no"}`);
-    // capability deltas
+    if (has("warrantNumber")) cmp("Warrant", before.warrantNumber, after.warrantNumber);
+    if (has("role")) cmp("Role", before.role, after.role);
+    if (has("team")) cmp("Team", before.team, after.team);
+    if (has("hub")) cmp("Hub", before.hub, after.hub);
+    if (has("acting") && before.acting !== after.acting) changes.push(`Acting: ${before.acting ? "yes" : "no"} → ${after.acting ? "yes" : "no"}`);
+    if (has("resigned") && before.resigned !== after.resigned) changes.push(`Resigned/moved: ${before.resigned ? "yes" : "no"} → ${after.resigned ? "yes" : "no"}`);
+    // capability deltas — only for capability columns that were in the sheet
     CAPABILITIES.forEach(cap => {
+      const a = (after.capabilities || {})[cap.key];
+      if (a === undefined) return;
       const b = (before.capabilities || {})[cap.key] || "unknown";
-      const a = (after.capabilities || {})[cap.key] || "unknown";
       if (b !== a) changes.push(`${cap.label}: ${CAP_STATE_META[b].chip} → ${CAP_STATE_META[a].chip}`);
     });
     return changes;
@@ -4231,8 +4331,12 @@ function ReportsView(){
 
   const [teamFilter, setTeamFilter] = React.useState("");
   const [hubFilter, setHubFilter] = React.useState("");
+  // Resigned/moved staff are excluded by default so role/hub/category charts agree
+  // with the restriction split (which already excludes them). Toggle to include.
+  const [showResigned, setShowResigned] = React.useState(false);
 
   const filteredStaff = staff.filter(s =>
+    (showResigned || !s.resigned) &&
     (!teamFilter || s.team === teamFilter) &&
     (!hubFilter || s.hub === hubFilter));
   const filteredIds = new Set(filteredStaff.map(s => s.id));
@@ -4288,6 +4392,11 @@ function ReportsView(){
       <div className="flex items-center gap-3 mb-5 flex-wrap">
         <Select value={teamFilter} onChange={setTeamFilter} placeholder="All teams" options={settings.teams || TEAMS} className="w-44"/>
         <Select value={hubFilter} onChange={setHubFilter} placeholder="All hubs" options={activeHubs} className="w-40"/>
+        <button onClick={() => setShowResigned(p => !p)}
+                aria-pressed={showResigned}
+                className={`px-3 py-2 rounded-xl text-[12.5px] font-semibold transition ${showResigned ? "bg-rose-50 text-rose-600 dark:bg-rose-900/20" : "bg-card border border-softline text-ink-600 dark:border-ink-800 hover:border-brand-300"}`}>
+          {showResigned ? "Including resigned / moved" : "Excluding resigned / moved"}
+        </button>
         <div className="ml-auto text-[12px] text-ink-500">{filteredStaff.length} staff · {filteredTasks.filter(t => !t.completed).length} open tasks</div>
       </div>
 
@@ -4398,7 +4507,7 @@ function ReportsView(){
    SETTINGS VIEW
    ========================================================================= */
 function SettingsView({ onNav }){
-  const { store, setSetting, setMaxHubSize, setHubArchived, addHub, setPalette, addToList, removeFromList, replaceStore, resetStore, saveState } = useStore();
+  const { store, setSetting, setMaxHubSize, setHubArchived, addHub, setPalette, addToList, removeFromList, replaceStore, resetStore, loadSampleData, saveState } = useStore();
   const fileRef = React.useRef(null);
   const wsRef = React.useRef(null);
   const logoRef = React.useRef(null);
@@ -4702,11 +4811,12 @@ function SettingsView({ onNav }){
           )}
         </Card>
 
-        <Card title="Quick update — Excel" className="lg:col-span-2">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <Card title="Data — backup, restore & reset" className="lg:col-span-2">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div>
-              <div className="text-[13px] text-ink-700 dark:text-ink-300 mb-3">
-                Export the staff list to Excel, amend it offline, then re-import. The export uses the same column layout the importer recognises, so a round-trip is clean.
+              <div className="text-[12.5px] font-semibold text-ink-800 dark:text-ink-200 mb-1">Excel round-trip</div>
+              <div className="text-[12px] text-ink-500 mb-3">
+                Export the staff list, amend offline, re-import. Same column layout the importer recognises.
               </div>
               <div className="space-y-2">
                 <Button onClick={exportExcel} className="w-full justify-start"><Ic.download width="14" height="14"/> Export staff to Excel</Button>
@@ -4714,10 +4824,25 @@ function SettingsView({ onNav }){
               </div>
             </div>
             <div>
-              <div className="text-[13px] text-ink-700 dark:text-ink-300 mb-3">
-                A full workspace zip is the proper backup — staff, tasks, settings, training records and file attachments all together. See below.
+              <div className="text-[12.5px] font-semibold text-ink-800 dark:text-ink-200 mb-1">JSON backup</div>
+              <div className="text-[12px] text-ink-500 mb-3">
+                Data only (staff, tasks, settings) — no file attachments. Use the workspace zip below for a full backup.
               </div>
               <div className="space-y-2">
+                <Button onClick={exportData} className="w-full justify-start"><Ic.download width="14" height="14"/> Export JSON backup</Button>
+                <Button variant="outline" onClick={() => fileRef.current?.click()} className="w-full justify-start"><Ic.upload width="14" height="14"/> Import from JSON…</Button>
+                <input ref={fileRef} type="file" accept=".json,application/json" onChange={importData} className="hidden"/>
+              </div>
+            </div>
+            <div>
+              <div className="text-[12.5px] font-semibold text-ink-800 dark:text-ink-200 mb-1">Sample & reset</div>
+              <div className="text-[12px] text-ink-500 mb-3">
+                Load a demo dataset to explore, or wipe everything back to empty.
+              </div>
+              <div className="space-y-2">
+                <Button variant="outline" onClick={() => { if (store.staff.length === 0 || confirm("Replace current data with the sample dataset?")) loadSampleData(); }} className="w-full justify-start">
+                  <Ic.spark width="14" height="14"/> Load sample data
+                </Button>
                 <Button variant="dangerSoft" onClick={() => { if (confirm("Wipe everything? This cannot be undone.")) resetStore(); }} className="w-full justify-start">
                   <Ic.trash width="14" height="14"/> Reset to empty
                 </Button>
@@ -4801,7 +4926,7 @@ function SettingsView({ onNav }){
 
         <Card title="About" className="lg:col-span-2">
           <div className="text-[13px] text-ink-700 dark:text-ink-300 space-y-2">
-            <p>Staff Console — a tool for managing staff, tasks and training across your hubs.</p>
+            <p>Staff Console — a tool for managing staff, tasks and skills across your hubs.</p>
             <p>Everything saves to this browser. Nothing leaves your device unless you export it.</p>
             <div className="grid grid-cols-3 gap-3 mt-4 text-[12px]">
               <div className="p-3 bg-canvas dark:bg-ink-900/40 rounded-xl">
@@ -4854,7 +4979,7 @@ function ListEditor({ title, eyebrow, items, onAdd, onRemove }){
    APP SHELL
    ========================================================================= */
 function App(){
-  const { store } = useStore();
+  const { store, loadSampleData } = useStore();
   // Guard against stale pinnedView from prior versions (e.g. "training" which no longer exists)
   const validNavIds = NAV.map(n => n.id);
   const initialView = validNavIds.includes(store.settings.pinnedView) ? store.settings.pinnedView : "overview";
@@ -4901,13 +5026,16 @@ function App(){
         <Modal open onClose={() => setFirstRun(false)} title="Welcome to Staff Console" size="md"
                footer={<>
                  <Button variant="ghost" onClick={() => setFirstRun(false)}>Got it</Button>
+                 <Button variant="outline" onClick={() => { loadSampleData(); setView("overview"); setFirstRun(false); }}>
+                   <Ic.spark width="14" height="14"/> Load sample data
+                 </Button>
                  <Button onClick={() => { setView("import"); setFirstRun(false); }}>
                    <Ic.upload width="14" height="14"/> Import from Excel
                  </Button>
                </>}>
           <div className="space-y-3 text-[13.5px] text-ink-700 dark:text-ink-300">
             <p>Manage your team — staff, capabilities, tasks and files. Everything autosaves to this browser.</p>
-            <p>To get started, import a staff spreadsheet, or head to Settings to name the dashboard for your team.</p>
+            <p>To get started, <strong>load the sample data</strong> to explore, import a staff spreadsheet, or head to Settings to name the dashboard for your team.</p>
             <p className="text-ink-500 text-[12.5px]">Browser data clears in private mode or if you wipe the cache. Export to Excel weekly as a backup.</p>
           </div>
         </Modal>
