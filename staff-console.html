@@ -115,7 +115,33 @@
 <!-- React + Babel -->
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<!-- Library load guard. Plain ES5 (no JSX/Babel) so it runs even when React or
+     Babel themselves were blocked — police networks frequently block CDNs, and
+     a blank screen with no explanation is the worst failure mode. NOTE: for an
+     air-gapped / locked-down deployment, vendor these libraries locally and add
+     Subresource Integrity (SRI) hashes; that can't be hard-coded here without a
+     verified build. -->
+<script>
+  window.addEventListener("load", function () {
+    var need = [
+      ["React", window.React], ["ReactDOM", window.ReactDOM],
+      ["Babel", window.Babel], ["Chart.js", window.Chart],
+      ["Leaflet", window.L], ["XLSX", window.XLSX], ["JSZip", window.JSZip]
+    ];
+    var missing = need.filter(function (n) { return !n[1]; }).map(function (n) { return n[0]; });
+    if (missing.length === 0) return;
+    var b = document.getElementById("boot");
+    if (!b) return;
+    b.className = "boot";
+    b.innerHTML = '<div style="max-width:460px;text-align:center;font-family:Carlito,Calibri,sans-serif;color:#6B7180;padding:24px">'
+      + '<div style="font-weight:700;font-size:16px;color:#0F1320;margin-bottom:8px">Staff Console couldn’t load</div>'
+      + 'These libraries were blocked or unreachable: <b>' + missing.join(", ") + '</b>.<br><br>'
+      + 'This usually means the network blocked a CDN. Open the file on an unrestricted '
+      + 'connection, or use an offline build with the libraries vendored locally.</div>';
+  });
+</script>
 
 <style>
   :root {
@@ -1106,11 +1132,17 @@ function StoreProvider({ children }){
     reason: testPersistence() ? null : "blocked"
   }));
 
-  // Autosave on every store change (debounced via the React render cycle).
-  // We track the result so the header can show a save indicator and surface failures.
+  // Autosave on store change — debounced so a burst of edits writes once, and
+  // skipping the initial mount (loadStore already persisted the loaded store, so
+  // re-stringifying the whole store on first render was pure waste).
+  const firstSave = React.useRef(true);
   React.useEffect(() => {
-    const result = saveStore(store);
-    setSaveState(s => ({ ...s, ...result }));
+    if (firstSave.current) { firstSave.current = false; return; }
+    const t = setTimeout(() => {
+      const result = saveStore(store);
+      setSaveState(s => ({ ...s, ...result }));
+    }, 500);
+    return () => clearTimeout(t);
   }, [store]);
 
   // Garbage-collect orphan IndexedDB blobs whenever the set of referenced blob ids
@@ -1769,10 +1801,18 @@ const PALETTE_PRESETS = [
 function ChartView({ type, data, options, height = 240 }){
   const ref = React.useRef(null);
   const chartRef = React.useRef(null);
+  // Track the dark class via an observer rather than reading classList inside a
+  // dependency array (which is brittle and only worked by render coincidence).
+  const [isDark, setIsDark] = React.useState(() => document.documentElement.classList.contains("dark"));
+  React.useEffect(() => {
+    const el = document.documentElement;
+    const obs = new MutationObserver(() => setIsDark(el.classList.contains("dark")));
+    obs.observe(el, { attributes: true, attributeFilter: ["class"] });
+    return () => obs.disconnect();
+  }, []);
   React.useEffect(() => {
     if (!ref.current) return;
     if (chartRef.current) { chartRef.current.destroy(); }
-    const isDark = document.documentElement.classList.contains("dark");
     const ink500 = isDark ? "#8B91A4" : "#6B7180";
     const grid   = isDark ? "rgba(255,255,255,.06)" : "rgba(15,19,32,.05)";
     const merged = {
@@ -1790,7 +1830,7 @@ function ChartView({ type, data, options, height = 240 }){
     };
     chartRef.current = new Chart(ref.current, { type, data, options: merged });
     return () => chartRef.current && chartRef.current.destroy();
-  }, [type, JSON.stringify(data), JSON.stringify(options), document.documentElement.classList.contains("dark")]);
+  }, [type, JSON.stringify(data), JSON.stringify(options), isDark]);
   // Accessible text alternative: Chart.js draws to <canvas>, which is opaque to
   // assistive tech. Expose the series as a visually-hidden data table and label
   // the figure (WCAG 1.1.1 — non-text content).
@@ -5188,15 +5228,25 @@ function App(){
 /* =========================================================================
    MOUNT
    ========================================================================= */
-const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(<StoreProvider><App/></StoreProvider>);
+try {
+  const root = ReactDOM.createRoot(document.getElementById("root"));
+  root.render(<StoreProvider><App/></StoreProvider>);
+} catch (err) {
+  const b = document.getElementById("boot");
+  if (b) {
+    b.className = "boot";
+    b.innerHTML = '<div style="max-width:460px;text-align:center;font-family:Carlito,Calibri,sans-serif;color:#6B7180;padding:24px">'
+      + '<div style="font-weight:700;font-size:16px;color:#0F1320;margin-bottom:8px">Staff Console hit an error starting up</div>'
+      + String(err && err.message || err) + '</div>';
+  }
+}
 
-// Safety net: if React fails to mount within 12s (e.g. a CDN library was blocked),
-// drop the splash and show a clear message instead of an indefinite spinner.
+// Safety net: if the splash is still up after 12s (libs present but render
+// stalled), surface a message instead of an indefinite spinner.
 setTimeout(() => {
   const b = document.getElementById("boot");
   if (b && !b.classList.contains("hide")) {
-    b.innerHTML = '<div style="max-width:420px;text-align:center;font-family:Carlito,sans-serif;color:#6B7180;padding:24px">'
+    b.innerHTML = '<div style="max-width:420px;text-align:center;font-family:Carlito,Calibri,sans-serif;color:#6B7180;padding:24px">'
       + '<div style="font-weight:700;font-size:16px;color:#0F1320;margin-bottom:8px">Staff Console couldn’t start</div>'
       + 'A required library failed to load. This usually means the network blocked a CDN. '
       + 'Try again on an unrestricted connection, or use an offline build.</div>';
