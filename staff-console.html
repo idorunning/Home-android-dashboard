@@ -835,6 +835,13 @@ function contrastRatio(a, b){
   return (hi + 0.05) / (lo + 0.05);
 }
 
+// Append an entry to the store's append-only audit log (capped). Pure — returns
+// a new store. Public-sector accountability: who/what/when for key actions.
+function appendAudit(store, kind, summary){
+  const entry = { id: uid("aud"), at: new Date().toISOString(), kind, summary };
+  return { ...store, auditLog: [entry, ...(store.auditLog || [])].slice(0, 500) };
+}
+
 const fmt = {
   date: iso => {
     if (!iso) return "—";
@@ -1298,8 +1305,15 @@ function StoreProvider({ children }){
         missing: diff.missing.map(m => ({ id: m.id, name: m.name, warrantNumber: m.warrantNumber }))
       };
 
-      return { ...p, staff, imports: [importRecord, ...(p.imports || [])].slice(0, 20) };
+      return appendAudit(
+        { ...p, staff, imports: [importRecord, ...(p.imports || [])].slice(0, 20) },
+        "import", `Imported ${fileName || "spreadsheet"}: +${diff.added.length} new, ~${diff.updated.length} updated, ${diff.missing.length} flagged missing`
+      );
     }),
+
+    // AUDIT — append-only change log (public-sector accountability)
+    logAudit: (kind, summary) => setStore(p => appendAudit(p, kind, summary)),
+    clearAudit: () => setStore(p => appendAudit({ ...p, auditLog: [] }, "audit", "Audit log cleared")),
 
     // SETTINGS
     setSetting: (key, val) => setStore(p => ({ ...p, settings: { ...p.settings, [key]: val } })),
@@ -1333,9 +1347,9 @@ function StoreProvider({ children }){
     })),
 
     // BULK
-    replaceStore: (next) => setStore(ensureCurrent(next)),
+    replaceStore: (next) => setStore(appendAudit(ensureCurrent(next), "restore", `Restored data: ${(next.staff||[]).length} staff, ${(next.tasks||[]).length} tasks`)),
     resetStore: () => setStore(DEFAULT_STORE()),
-    loadSampleData: () => setStore(buildSampleStore())
+    loadSampleData: () => setStore(appendAudit(buildSampleStore(), "sample", "Loaded the sample dataset"))
 
   }), [store, saveState]);
 
@@ -2438,8 +2452,9 @@ function OverviewView({ onNav }){
    STAFF VIEW
    ========================================================================= */
 function StaffView({ query }){
-  const { store, addStaff, addStaffBulk, updateStaff, removeStaff } = useStore();
+  const { store, addStaff, addStaffBulk, updateStaff, removeStaff, setSetting } = useStore();
   const { staff, tasks, settings } = store;
+  const savedViews = settings.staffViews || [];
 
   const archivedHubs = settings.archivedHubs || [];
   const activeHubs = (settings.hubs || HUBS).filter(h => !archivedHubs.includes(h));
@@ -2454,6 +2469,28 @@ function StaffView({ query }){
   const [editing, setEditing] = React.useState(null);  // staff object or "new"
   const [quickOpen, setQuickOpen] = React.useState(false);
   const [showResigned, setShowResigned] = React.useState(false);
+
+  // Saved views — named filter/sort sets persisted in settings so common slices
+  // ("Worthing Response, available") are one click, not five.
+  const applyView = (v) => {
+    if (!v) return;
+    const f = v.filters || {};
+    setHubFilter(f.hubFilter ?? "all");
+    setTeamFilter(f.teamFilter ?? "");
+    setRoleFilter(f.roleFilter ?? "");
+    setStatusFilter(f.statusFilter ?? "");
+    setRestrictionFilter(f.restrictionFilter ?? "");
+    setShowResigned(!!f.showResigned);
+    setSortBy(f.sortBy || { key: "name", dir: "asc" });
+  };
+  const saveCurrentView = () => {
+    const name = (prompt("Name this view") || "").trim();
+    if (!name) return;
+    const filters = { hubFilter, teamFilter, roleFilter, statusFilter, restrictionFilter, showResigned, sortBy };
+    const next = [...savedViews.filter(v => v.name !== name), { id: uid("vw"), name, filters }];
+    setSetting("staffViews", next);
+  };
+  const deleteView = (id) => setSetting("staffViews", savedViews.filter(v => v.id !== id));
 
   useBusListener(Bus.staffAdd,   () => setEditing("new"));
   useBusListener(Bus.staffQuick, () => setQuickOpen(true));
@@ -2546,6 +2583,15 @@ function StaffView({ query }){
           <Button variant="ghost" size="sm" onClick={() => { setTeamFilter(""); setRoleFilter(""); setStatusFilter(""); setRestrictionFilter(""); }}>
             Reset
           </Button>
+        )}
+        <div className="w-px h-6 bg-softline dark:bg-ink-800 mx-1"/>
+        <Select value="" onChange={v => applyView(savedViews.find(x => x.id === v))}
+                placeholder={savedViews.length ? "Saved views…" : "No saved views"}
+                options={savedViews.map(v => ({ value: v.id, label: v.name }))} className="w-40"/>
+        <Button variant="outline" size="sm" onClick={saveCurrentView}><Ic.pin width="13" height="13"/> Save view</Button>
+        {savedViews.length > 0 && (
+          <Select value="" onChange={v => { if (v && confirm("Delete this saved view?")) deleteView(v); }}
+                  placeholder="Delete view…" options={savedViews.map(v => ({ value: v.id, label: v.name }))} className="w-36"/>
         )}
       </div>
 
@@ -4599,6 +4645,23 @@ function ReportsView(){
                 className={`px-3 py-2 rounded-xl text-[12.5px] font-semibold transition ${showResigned ? "bg-rose-50 text-rose-600 dark:bg-rose-900/20" : "bg-card border border-softline text-ink-600 dark:border-ink-800 hover:border-brand-300"}`}>
           {showResigned ? "Including resigned / moved" : "Excluding resigned / moved"}
         </button>
+        <Button size="sm" variant="outline" onClick={() => {
+          // One CSV with every composition table the page charts, so the figures
+          // are auditable / shareable without screenshots.
+          const sec = [];
+          sec.push(["By role"], ["Role","Count"], ...Object.entries(byRole), []);
+          sec.push(["By hub"], ["Hub","Count"], ...Object.entries(byHub), []);
+          sec.push(["Open tasks by category"], ["Category","Count"], ...Object.entries(tasksByCategory), []);
+          sec.push(["Restriction split"], ["State","Count"],
+            ["Available", restrictionSplit.free], ["Restricted", restrictionSplit.restricted], []);
+          sec.push(["Restrictions by type"], ["Type","Count"], ...Object.entries(restrictionSplit.byType));
+          const csv = sec.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
+          const blob = new Blob([csv], { type: "text/csv" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = `staff-console-report-${new Date().toISOString().slice(0,10)}.csv`;
+          a.click();
+        }}><Ic.download width="13" height="13"/> Export CSV</Button>
         <div className="ml-auto text-[12px] text-ink-500">{filteredStaff.length} staff · {filteredTasks.filter(t => !t.completed).length} open tasks</div>
       </div>
 
@@ -4709,7 +4772,7 @@ function ReportsView(){
    SETTINGS VIEW
    ========================================================================= */
 function SettingsView({ onNav }){
-  const { store, setSetting, setMaxHubSize, setHubArchived, addHub, setPalette, addToList, removeFromList, replaceStore, resetStore, loadSampleData, saveState } = useStore();
+  const { store, setSetting, setMaxHubSize, setHubArchived, addHub, setPalette, addToList, removeFromList, replaceStore, resetStore, loadSampleData, clearAudit, saveState } = useStore();
   const fileRef = React.useRef(null);
   const wsRef = React.useRef(null);
   const logoRef = React.useRef(null);
@@ -5140,6 +5203,37 @@ function SettingsView({ onNav }){
               );
             })}
           </div>
+        </Card>
+
+        <Card title="Audit log" eyebrow="Append-only record of imports, restores and resets" className="lg:col-span-2"
+              action={<>
+                <Button size="sm" variant="outline" disabled={!(store.auditLog || []).length} onClick={() => {
+                  const rows = [["When","Kind","Summary"], ...(store.auditLog || []).map(a => [
+                    new Date(a.at).toISOString(), a.kind, a.summary
+                  ])];
+                  const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
+                  const blob = new Blob([csv], { type: "text/csv" });
+                  const a = document.createElement("a");
+                  a.href = URL.createObjectURL(blob);
+                  a.download = `staff-console-audit-${new Date().toISOString().slice(0,10)}.csv`;
+                  a.click();
+                }}><Ic.download width="13" height="13"/> Export CSV</Button>
+                <Button size="sm" variant="ghost" disabled={!(store.auditLog || []).length}
+                        onClick={() => { if (confirm("Clear the audit log? The clear itself is recorded.")) clearAudit(); }}>Clear</Button>
+              </>}>
+          {(store.auditLog || []).length === 0 ? (
+            <div className="py-6 text-center text-[13px] text-ink-500">No activity recorded yet. Imports, restores and resets will appear here.</div>
+          ) : (
+            <div className="max-h-72 overflow-y-auto divide-y divide-softline dark:divide-ink-800/60">
+              {(store.auditLog || []).slice(0, 200).map(a => (
+                <div key={a.id} className="flex items-start gap-3 py-2 text-[12.5px]">
+                  <span className="font-mono text-ink-500 shrink-0 w-32">{fmt.dateTime(a.at)}</span>
+                  <Pill tone="neutral">{a.kind}</Pill>
+                  <span className="flex-1 text-ink-700 dark:text-ink-300">{a.summary}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </Card>
 
         <Card title="About" className="lg:col-span-2">
