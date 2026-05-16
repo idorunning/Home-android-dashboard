@@ -1720,7 +1720,7 @@ function TrendChip({ value, suffix = "%", positive }){
   );
 }
 
-function KpiCard({ icon, iconTone, label, value, trend, suffix }){
+function KpiCard({ icon, iconTone, label, value, trend, suffix, sub, onClick }){
   const tones = {
     brand:  "bg-brand-50 text-brand-500",
     violet: "bg-violet-50 text-violet-500",
@@ -1729,8 +1729,8 @@ function KpiCard({ icon, iconTone, label, value, trend, suffix }){
     amber:  "bg-amber2-50 text-amber2-500",
     sky:    "bg-sky2-50 text-sky2-500"
   };
-  return (
-    <div className="card-host bg-card border border-softline dark:border-ink-800/60 rounded-xl2 shadow-card p-5 anim-fade-up">
+  const body = (
+    <>
       <div className="flex items-start justify-between mb-4">
         <div className={`w-11 h-11 rounded-xl flex items-center justify-center ${tones[iconTone] || tones.brand}`}>
           {icon}
@@ -1739,8 +1739,13 @@ function KpiCard({ icon, iconTone, label, value, trend, suffix }){
       </div>
       <div className="text-[12.5px] text-ink-500 mb-1">{label}</div>
       <div className="font-display font-extrabold text-[28px] text-ink-900 dark:text-ink-100 tnum leading-none">{value}</div>
-    </div>
+      {sub && <div className="text-[11.5px] text-ink-500 mt-1.5">{sub}</div>}
+    </>
   );
+  const cls = "card-host bg-card border border-softline dark:border-ink-800/60 rounded-xl2 shadow-card p-5 anim-fade-up text-left w-full";
+  return onClick
+    ? <button type="button" onClick={onClick} className={`${cls} hover:border-brand-300 transition`} aria-label={`${label}: ${value}. Open details.`}>{body}</button>
+    : <div className={cls}>{body}</div>;
 }
 
 function TagInput({ value = [], onChange, suggestions = [], placeholder = "Add tag…" }){
@@ -1951,8 +1956,12 @@ const VIEW_META = {
   settings:     { title: "Settings",              subtitle: "Branding, lists, colours and data" }
 };
 
-function Header({ view, onNav, query, onQuery }){
+function Header({ view, onNav, query, onQuery, onMenu, onOpenPalette }){
   const { store, setSetting, saveState } = useStore();
+  // The header search only filters Staff / Tasks / Files; on every other view it
+  // did nothing. Show the box only where it works, and a ⌘K palette trigger
+  // everywhere else.
+  const searchable = view === "staff" || view === "tasks" || view === "files";
   const baseMeta = VIEW_META[view] || { title: "Staff Console", subtitle: "" };
   const teamName = (store.settings.teamName || "").trim();
   const ownerName = (store.settings.ownerName || "").trim();
@@ -2007,12 +2016,18 @@ function Header({ view, onNav, query, onQuery }){
     <header style={{ background: "var(--c-header, var(--card-bg, #fff))" }}
             className="border-b border-softline dark:border-ink-800/60 px-8 py-4 shrink-0">
       <div className="flex items-center justify-between gap-6 flex-wrap">
-        <div className="min-w-0">
+        <div className="min-w-0 flex items-center gap-3">
+          <button onClick={onMenu} aria-label="Open navigation menu"
+                  className="lg:hidden w-9 h-9 rounded-xl flex items-center justify-center text-ink-600 hover:bg-canvas dark:hover:bg-ink-800/50 shrink-0">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+          </button>
+          <div className="min-w-0">
           <h1 className="font-display font-extrabold text-[22px] text-ink-900 dark:text-ink-100 leading-tight tracking-tight">{meta.title}</h1>
           {meta.subtitle && <div className="text-[12.5px] text-ink-500 mt-0.5">{meta.subtitle}</div>}
           {ownerName && view === "overview" && (
             <div className="text-[11.5px] text-ink-500 mt-1">Held by {ownerName}</div>
           )}
+          </div>
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
@@ -2038,12 +2053,21 @@ function Header({ view, onNav, query, onQuery }){
             </button>
           )}
 
-          <div className="relative">
-            <Ic.search width="15" height="15" className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-400 pointer-events-none"/>
-            <input value={query} onChange={e => onQuery(e.target.value)}
-                   placeholder="Search…"
-                   className="pl-9 pr-3 py-2 text-[13px] rounded-xl w-56"/>
-          </div>
+          {searchable ? (
+            <div className="relative">
+              <Ic.search width="15" height="15" className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-400 pointer-events-none"/>
+              <input value={query} onChange={e => onQuery(e.target.value)}
+                     placeholder={`Search ${view}…`} aria-label={`Search ${view}`}
+                     className="pl-9 pr-3 py-2 text-[13px] rounded-xl w-56"/>
+            </div>
+          ) : (
+            <button onClick={onOpenPalette} aria-label="Open command palette"
+                    className="flex items-center gap-2 pl-3 pr-2 py-2 text-[13px] rounded-xl border border-softline dark:border-ink-800 text-ink-500 hover:border-brand-300 w-56">
+              <Ic.search width="15" height="15" className="text-ink-400"/>
+              <span className="flex-1 text-left">Search…</span>
+              <kbd className="text-[10px] font-mono border border-softline rounded px-1 py-0.5">⌘K</kbd>
+            </button>
+          )}
 
           <IconBtn onClick={() => onNav("tasks")} title={`${overdue} overdue task${overdue===1?"":"s"}`}>
             <span className="relative">
@@ -2148,6 +2172,20 @@ function OverviewView({ onNav }){
   }, [staff]);
 
   const notInImport = staff.filter(s => !s.resigned && s.inLatestImport === false).length;
+
+  // Establishment vs strength — the headline policing workforce metric. Funded
+  // establishment is the sum of per-hub strength targets; strength is who's
+  // actually on (active, not restricted). A negative gap = under strength.
+  const establishment = React.useMemo(() => {
+    const archived = settings.archivedHubs || [];
+    const sizes = settings.maxHubSizes || {};
+    const target = (settings.hubs || HUBS)
+      .filter(h => !archived.includes(h))
+      .reduce((sum, h) => sum + (Number(sizes[h]) || 0), 0);
+    const gap = totalPersonnel - target;
+    const pct = target > 0 ? Math.round((totalPersonnel / target) * 100) : null;
+    return { target, strength: totalPersonnel, gap, pct };
+  }, [staff, settings.hubs, settings.archivedHubs, settings.maxHubSizes, totalPersonnel]);
 
   // --- STAFFING PROJECTION GRAPH ---
   // Solid bold lines per active hub, plus thinner team totals so you can see both
@@ -2261,12 +2299,18 @@ function OverviewView({ onNav }){
         )}
       </Card>
 
-      {/* KPI row */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-        <KpiCard iconTone="brand"  icon={<Ic.staff width="20" height="20"/>}    label="Staff on strength"   value={totalPersonnel} />
-        <KpiCard iconTone="violet" icon={<Ic.task width="20" height="20"/>}     label="Open tasks"          value={activeTasks} />
-        <KpiCard iconTone="teal"   icon={<Ic.shield width="20" height="20"/>}   label="Capability coverage" value={capCoverage + "%"} positive={capCoverage >= 50}/>
-        <KpiCard iconTone="amber"  icon={<Ic.bell width="20" height="20"/>}     label="Due or overdue"      value={todayItems.length} positive={todayItems.length === 0}/>
+      {/* KPI row — every card drills through to the underlying list */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-6">
+        <KpiCard iconTone="brand"  icon={<Ic.staff width="20" height="20"/>}    label="Staff on strength"   value={totalPersonnel} onClick={() => onNav("staff")} />
+        <KpiCard iconTone="sky"    icon={<Ic.users2 width="20" height="20"/>}   label="Establishment"
+                 value={establishment.target || "—"}
+                 sub={establishment.pct == null
+                   ? "Set hub targets in Settings"
+                   : `${establishment.strength}/${establishment.target} · ${establishment.gap >= 0 ? "+" : ""}${establishment.gap} (${establishment.pct}%)`}
+                 onClick={() => onNav("reports")} />
+        <KpiCard iconTone="violet" icon={<Ic.task width="20" height="20"/>}     label="Open tasks"          value={activeTasks} onClick={() => onNav("tasks")} />
+        <KpiCard iconTone="teal"   icon={<Ic.shield width="20" height="20"/>}   label="Capability coverage" value={capCoverage + "%"} onClick={() => onNav("capabilities")}/>
+        <KpiCard iconTone="amber"  icon={<Ic.bell width="20" height="20"/>}     label="Due or overdue"      value={todayItems.length} onClick={() => onNav("tasks")}/>
       </div>
 
       {notInImport > 0 && (
@@ -5156,10 +5200,78 @@ function ListEditor({ title, eyebrow, items, onAdd, onRemove }){
 }
 
 /* =========================================================================
+   COMMAND PALETTE (⌘K / Ctrl-K) — jump to a view, person, hub or action
+   ========================================================================= */
+function CommandPalette({ open, onClose, store, onNav, setQuery, loadSampleData, toggleTheme }){
+  const [q, setQ] = React.useState("");
+  const [idx, setIdx] = React.useState(0);
+  const inputRef = React.useRef(null);
+  React.useEffect(() => { if (open) { setQ(""); setIdx(0); setTimeout(() => inputRef.current?.focus(), 0); } }, [open]);
+
+  const items = React.useMemo(() => {
+    const go = (view, q2) => () => { onNav(view); if (q2 != null) setQuery(q2); onClose(); };
+    const list = [];
+    NAV.forEach(n => list.push({ kind: "View", label: n.label, run: go(n.id) }));
+    list.push({ kind: "Action", label: "New staff member", run: () => { onNav("staff"); setQuery(""); onClose(); setTimeout(() => Bus.trigStaffAdd(), 30); } });
+    list.push({ kind: "Action", label: "Quick add staff", run: () => { onNav("staff"); onClose(); setTimeout(() => Bus.trigStaffQuick(), 30); } });
+    list.push({ kind: "Action", label: "New task", run: () => { onNav("tasks"); onClose(); setTimeout(() => Bus.trigTaskAdd(), 30); } });
+    list.push({ kind: "Action", label: "New chaser", run: () => { onNav("tasks"); onClose(); setTimeout(() => Bus.trigChaserAdd(), 30); } });
+    list.push({ kind: "Action", label: "Import spreadsheet", run: go("import") });
+    list.push({ kind: "Action", label: "Load sample data", run: () => { if (store.staff.length === 0 || confirm("Replace current data with the sample dataset?")) { loadSampleData(); onNav("overview"); } onClose(); } });
+    list.push({ kind: "Action", label: "Toggle light / dark theme", run: () => { toggleTheme(); onClose(); } });
+    (store.settings.hubs || HUBS).forEach(h => list.push({ kind: "Hub", label: h, run: go("staff", h) }));
+    (store.settings.teams || TEAMS).forEach(t => list.push({ kind: "Team", label: t, run: go("staff", t) }));
+    store.staff.forEach(s => list.push({ kind: "Person", label: s.name, hint: `${s.role} · ${s.hub}`, run: go("staff", s.name) }));
+    return list;
+  }, [store, onNav, setQuery, onClose, loadSampleData, toggleTheme]);
+
+  const ql = q.trim().toLowerCase();
+  const filtered = (ql === "" ? items.filter(i => i.kind !== "Person") : items.filter(i =>
+    i.label.toLowerCase().includes(ql) || i.kind.toLowerCase().includes(ql))).slice(0, 50);
+  const clamped = Math.min(idx, Math.max(0, filtered.length - 1));
+
+  const onKey = e => {
+    if (e.key === "ArrowDown") { e.preventDefault(); setIdx(i => Math.min(i + 1, filtered.length - 1)); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); setIdx(i => Math.max(i - 1, 0)); }
+    else if (e.key === "Enter") { e.preventDefault(); filtered[clamped] && filtered[clamped].run(); }
+    else if (e.key === "Escape") { e.preventDefault(); onClose(); }
+  };
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-[120] flex items-start justify-center modal-backdrop p-4 pt-[12vh] anim-fade"
+         onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div role="dialog" aria-modal="true" aria-label="Command palette"
+           className="bg-card rounded-2xl shadow-pop border border-softline dark:border-ink-800 w-full max-w-xl anim-fade-up overflow-hidden">
+        <div className="flex items-center gap-2 px-4 py-3 border-b border-softline dark:border-ink-800">
+          <Ic.search width="16" height="16" className="text-ink-400"/>
+          <input ref={inputRef} value={q} onChange={e => { setQ(e.target.value); setIdx(0); }} onKeyDown={onKey}
+                 placeholder="Jump to a view, person, hub or action…"
+                 aria-label="Command palette search"
+                 className="flex-1 bg-transparent border-0 outline-none text-[14px] py-1"/>
+          <kbd className="text-[10.5px] text-ink-400 font-mono border border-softline rounded px-1.5 py-0.5">Esc</kbd>
+        </div>
+        <div className="max-h-[50vh] overflow-y-auto py-1" role="listbox" aria-label="Results">
+          {filtered.length === 0 && <div className="px-4 py-6 text-center text-[13px] text-ink-500">No matches.</div>}
+          {filtered.map((it, i) => (
+            <button key={i} type="button" role="option" aria-selected={i === clamped}
+                    onMouseEnter={() => setIdx(i)} onClick={() => it.run()}
+                    className={`w-full text-left px-4 py-2 flex items-center gap-3 text-[13.5px] ${i === clamped ? "bg-brand-50 dark:bg-brand-900/30 text-brand-600 dark:text-brand-300" : "hover:bg-canvas dark:hover:bg-ink-900/40"}`}>
+              <span className="text-[10px] uppercase tracking-wider text-ink-400 w-14 shrink-0">{it.kind}</span>
+              <span className="flex-1 truncate">{it.label}</span>
+              {it.hint && <span className="text-[11px] text-ink-400 truncate">{it.hint}</span>}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
    APP SHELL
    ========================================================================= */
 function App(){
-  const { store, loadSampleData } = useStore();
+  const { store, loadSampleData, setSetting } = useStore();
   // Guard against stale pinnedView from prior versions (e.g. "training" which no longer exists)
   const validNavIds = NAV.map(n => n.id);
   const initialView = validNavIds.includes(store.settings.pinnedView) ? store.settings.pinnedView : "overview";
@@ -5167,6 +5279,21 @@ function App(){
   const [query, setQuery] = React.useState("");
   const [collapsed, setCollapsed] = React.useState(false);
   const [firstRun, setFirstRun] = React.useState(() => store.staff.length === 0);
+  const [paletteOpen, setPaletteOpen] = React.useState(false);
+  const [mobileNav, setMobileNav] = React.useState(false);
+  const toggleTheme = () => setSetting("theme", store.settings.theme === "dark" ? "light" : "dark");
+
+  // ⌘K / Ctrl-K opens the command palette from anywhere.
+  React.useEffect(() => {
+    const h = e => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        setPaletteOpen(o => !o);
+      }
+    };
+    document.addEventListener("keydown", h);
+    return () => document.removeEventListener("keydown", h);
+  }, []);
 
   // Hide the boot splash once the app has actually rendered, not on a blind timer —
   // in-browser Babel compilation can take seconds, and a fixed timeout would reveal a
@@ -5194,14 +5321,28 @@ function App(){
     }
   };
 
+  const navTo = (v) => { setView(v); setMobileNav(false); };
   return (
     <div className="flex h-full">
       <a href="#main-content" className="skip-link">Skip to main content</a>
-      <Sidebar active={view} onNav={setView} collapsed={collapsed} onToggleCollapse={() => setCollapsed(p => !p)}/>
+
+      {/* Mobile drawer backdrop */}
+      {mobileNav && <div className="fixed inset-0 z-[80] bg-black/40 lg:hidden" onClick={() => setMobileNav(false)} aria-hidden="true"/>}
+
+      {/* Sidebar: static on lg+, off-canvas drawer below lg */}
+      <div className={`z-[90] max-lg:fixed max-lg:inset-y-0 max-lg:left-0 max-lg:transition-transform ${mobileNav ? "max-lg:translate-x-0" : "max-lg:-translate-x-full"}`}>
+        <Sidebar active={view} onNav={navTo} collapsed={collapsed} onToggleCollapse={() => setCollapsed(p => !p)}/>
+      </div>
+
       <div className="flex-1 flex flex-col min-w-0">
-        <Header view={view} onNav={setView} query={query} onQuery={setQuery}/>
+        <Header view={view} onNav={setView} query={query} onQuery={setQuery}
+                onMenu={() => setMobileNav(true)} onOpenPalette={() => setPaletteOpen(true)}/>
         <main id="main-content" tabIndex={-1} className="flex-1 min-h-0 focus:outline-none">{renderView()}</main>
       </div>
+
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)}
+                      store={store} onNav={setView} setQuery={setQuery}
+                      loadSampleData={loadSampleData} toggleTheme={toggleTheme}/>
 
       {firstRun && (
         <Modal open onClose={() => setFirstRun(false)} title="Welcome to Staff Console" size="md"
