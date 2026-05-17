@@ -390,15 +390,44 @@ const STORAGE_KEY_V2 = "smd.store.v2";
 
 // ROLE is the single personnel field — replaces the old rank + staffType split.
 const ROLES = ["PC", "Sergeant", "Police Staff", "Volunteer", "Special Constable"];
-// Is this person currently on a restriction (secondment, long-term sick, etc.)?
-// A restriction with no end date is treated as ongoing; with an end date, only
-// "current" if that date hasn't passed.
-function isOnRestriction(staff, asOf){
-  const r = staff && staff.restriction;
-  if (!r || !r.type) return false;
-  if (!r.endDate) return true;
-  const ref = asOf ? new Date(asOf) : new Date();
-  return new Date(r.endDate) >= ref;
+// DEPLOYMENT STATUS — the single availability concept (replaces the old
+// status + restriction split). `staff.deployment` is null for the default
+// "Available" (on team, operational, deployable, full strength), or
+// { category: 1|2|3, type?, endDate? } for one of the three exception bands.
+//   1 Non-operational, non-deployable (suspended, long-term sick)  → reduces strength
+//   2 Operational, non-deployable     (injured but at work)        → still counted
+//   3 Operational, off-team           (secondment, attachment)     → reduces strength
+const DEPLOY_CATS = [
+  { id: 1, label: "Non-operational, non-deployable", short: "Non-op",     tone: "rose",    reduces: true  },
+  { id: 2, label: "Operational, non-deployable",     short: "Op·non-dep", tone: "amber",   reduces: false },
+  { id: 3, label: "Operational, off-team",           short: "Off-team",   tone: "success", reduces: true  }
+];
+const DEPLOY_CAT_BY_ID = { 1: DEPLOY_CATS[0], 2: DEPLOY_CATS[1], 3: DEPLOY_CATS[2] };
+// Default editable sub-type lists per category (Settings → deploymentTypes).
+const DEFAULT_DEPLOYMENT_TYPES = {
+  1: ["Suspended", "Long-term sick"],
+  2: ["Injured – at work", "Restricted duties"],
+  3: ["Secondment", "Attachment"]
+};
+// Current deployment category for a staff member: null (Available) | 1 | 2 | 3.
+function deployCat(staff){
+  const d = staff && staff.deployment;
+  if (!d || !d.category) return null;
+  const c = Number(d.category);
+  return (c === 1 || c === 2 || c === 3) ? c : null;
+}
+// Counts toward available team strength? Available + Cat 2 count; resigned,
+// Cat 1 and Cat 3 do not.
+function countsTowardStrength(staff){
+  if (!staff || staff.resigned) return false;
+  const c = deployCat(staff);
+  return c !== 1 && c !== 3;
+}
+// Currently reducing the team's numbers (Cat 1 or Cat 3, not resigned).
+function isReduced(staff){
+  if (!staff || staff.resigned) return false;
+  const c = deployCat(staff);
+  return c === 1 || c === 3;
 }
 // Map spreadsheet role text → canonical role
 const ROLE_NORMALISE = {
@@ -412,12 +441,6 @@ const ROLE_NORMALISE = {
 const TEAMS = ["Response", "Investigations"];
 // HUB — the geographic base. Current live hubs; more can be added/archived in Settings.
 const HUBS = ["Worthing", "Horsham"];
-// Everyday availability status.
-const STATUSES = ["Active", "On Leave", "Training"];
-// Restriction / absence types — each carries an end date. A person can be Active AND on a
-// restriction; restrictions are tracked separately on staff.restriction = { type, endDate }.
-// Editable in Settings via settings.restrictionTypes.
-const RESTRICTION_TYPES = ["Secondment", "Long-term sick", "Attachment", "Restricted/Suspended"];
 const TASK_CATEGORIES = ["Welfare", "Performance", "Training", "Equipment", "Misconduct", "Operational", "Admin"];
 
 // Operational capabilities — fixed columns from the E-section spreadsheet.
@@ -486,9 +509,9 @@ const DEFAULT_STORE = () => ({
     // Headcount targets per hub — drives the staffing-level indicator on the dashboard
     maxHubSizes: { Worthing: 30, Horsham: 25 },
     roles: ROLES,
-    statuses: STATUSES,
-    // Restriction / absence types — each instance carries an end date
-    restrictionTypes: RESTRICTION_TYPES,
+    // Deployment status sub-types per category (1/2/3) — editable, each
+    // instance on a staff record may also carry an end date.
+    deploymentTypes: { ...DEFAULT_DEPLOYMENT_TYPES },
     tags: ["Taser", "Public Order Lv2", "Method of Entry", "Search Trained", "Cyber", "Standard Driver", "Response Driver", "Pursuit", "Drone", "FLO", "Mental Health First Aid"],
     categories: TASK_CATEGORIES,
     pinnedView: "overview"
@@ -549,21 +572,29 @@ function upgradeStaff(s){
   }
   delete u.supervisor;
   delete u.actingRank;
-  if (u.status === "Acting Up") u.status = "Active";
 
-  // --- v2.4: restriction = { type, endDate } | null, separate from availability status ---
-  if (u.restriction === undefined) {
-    // Old flat status list folded Sick/Secondment into status — lift them out
-    if (u.status === "Secondment")    u.restriction = { type: "Secondment", endDate: u.endDate || null };
-    else if (u.status === "Sick")     u.restriction = { type: "Long-term sick", endDate: null };
-    else u.restriction = null;
+  // --- Deployment status (replaces the old `status` + `restriction` split) ---
+  // null = Available (default). Legacy data is mapped to a category by type.
+  if (u.deployment === undefined) {
+    const r = (u.restriction && u.restriction.type) ? u.restriction : null;
+    const legacyType = r ? r.type
+      : (u.status === "Secondment") ? "Secondment"
+      : (u.status === "Sick") ? "Long-term sick"
+      : null;
+    if (!legacyType) {
+      u.deployment = null;   // Active / On Leave / Training / blank → Available
+    } else {
+      const t = legacyType.toLowerCase();
+      const cat = /second|attach|off.?team/.test(t) ? 3
+                : /suspend|restrict|sick|injur|non.?op/.test(t) ? 1
+                : 1;   // unknown legacy restriction → Cat 1 (safest: counts as reduced)
+      u.deployment = { category: cat, type: legacyType, endDate: (r && r.endDate) || null };
+    }
+  } else if (u.deployment && !DEPLOY_CAT_BY_ID[Number(u.deployment.category)]) {
+    u.deployment = null;
   }
-  // Normalise availability status to the current short list
-  if (!STATUSES.includes(u.status)) {
-    u.status = (u.status === "On Leave") ? "On Leave"
-             : (u.status === "Training") ? "Training"
-             : "Active";
-  }
+  delete u.status;
+  delete u.restriction;
 
   // resigned now means "resigned OR moved off my team" — keep the boolean, broaden the meaning
   if (u.resigned == null) u.resigned = false;
@@ -658,12 +689,22 @@ function ensureCurrent(store){
   // Ensure every hub a staff member uses actually exists in the hubs list
   const usedHubs = new Set(next.staff.map(p => p.hub).filter(Boolean));
   usedHubs.forEach(h => { if (!next.settings.hubs.includes(h)) next.settings.hubs.push(h); });
-  // restriction types and statuses — editable lists, default if absent
-  if (!Array.isArray(next.settings.restrictionTypes) || next.settings.restrictionTypes.length === 0) {
-    next.settings.restrictionTypes = def.settings.restrictionTypes;
-  }
-  if (!Array.isArray(next.settings.statuses) || next.settings.statuses.length === 0) {
-    next.settings.statuses = def.settings.statuses;
+  // Deployment sub-type lists per category. Seed defaults, and best-effort fold
+  // any legacy custom `restrictionTypes` into Cat 3 (secondment/attachment) or
+  // Cat 1 (everything else) so a customised old store doesn't lose its types.
+  const dt = next.settings.deploymentTypes;
+  if (!dt || typeof dt !== "object" || !dt[1] || !dt[2] || !dt[3]) {
+    next.settings.deploymentTypes = {
+      1: Array.isArray(dt && dt[1]) ? dt[1] : [...DEFAULT_DEPLOYMENT_TYPES[1]],
+      2: Array.isArray(dt && dt[2]) ? dt[2] : [...DEFAULT_DEPLOYMENT_TYPES[2]],
+      3: Array.isArray(dt && dt[3]) ? dt[3] : [...DEFAULT_DEPLOYMENT_TYPES[3]]
+    };
+    const legacy = Array.isArray(store.settings && store.settings.restrictionTypes) ? store.settings.restrictionTypes : [];
+    legacy.forEach(t => {
+      const isOff = /second|attach|off.?team/i.test(t);
+      const bucket = isOff ? next.settings.deploymentTypes[3] : next.settings.deploymentTypes[1];
+      if (!bucket.includes(t)) bucket.push(t);
+    });
   }
   // Branding — default to empty strings if absent
   if (typeof next.settings.teamName !== "string")  next.settings.teamName  = "";
@@ -678,6 +719,8 @@ function ensureCurrent(store){
   // drop dead settings keys
   delete next.settings.departments;
   delete next.settings.maxTeamSizes;
+  delete next.settings.statuses;
+  delete next.settings.restrictionTypes;
   return next;
 }
 
@@ -945,10 +988,17 @@ const HEADER_MAP = {
   "end": "endDate",
   "end date": "endDate",
   "leaving date": "endDate",
-  "restriction": "restrictionType",
-  "restriction type": "restrictionType",
-  "restriction end": "restrictionEnd",
-  "restriction end date": "restrictionEnd",
+  "deployment": "deployType",
+  "deployment category": "deployCategory",
+  "deployment status": "deployCategory",
+  "deployment type": "deployType",
+  "deployment end": "deployEnd",
+  "deployment end date": "deployEnd",
+  // legacy spreadsheet headers still understood on import
+  "restriction": "deployType",
+  "restriction type": "deployType",
+  "restriction end": "deployEnd",
+  "restriction end date": "deployEnd",
   "blues": "cap_blues",
   "taser": "cap_taser",
   "pursuit": "cap_pursuit",
@@ -1044,11 +1094,25 @@ function parseEsectionRows(rows){
     const hub = HUBS.includes(hubRaw) ? hubRaw : (hubRaw || "Worthing");
     // Acting — from an explicit column, or a note like "Acting Sgt"
     const acting = parseBool(rec.acting) || /acting\s*(sgt|sergeant)/i.test(rec.note || "");
-    // Restriction — optional { type, endDate }; only set if a recognised type is given
-    const restrictionRaw = (rec.restrictionType || "").trim();
-    const restriction = restrictionRaw
-      ? { type: restrictionRaw, endDate: parseSheetDate(rec.restrictionEnd) }
-      : null;
+    // Deployment — null (Available) unless a category or recognised type given.
+    // Category accepts 1/2/3 or label keywords; otherwise it's inferred from
+    // the sub-type text (secondment/attachment → 3; suspended/sick/etc → 1).
+    const dTypeRaw = (rec.deployType || "").trim();
+    const dCatRaw  = (rec.deployCategory == null ? "" : String(rec.deployCategory)).trim().toLowerCase();
+    let deployment = null;
+    if (dCatRaw || dTypeRaw) {
+      let cat = (dCatRaw === "1" || /non.?op/.test(dCatRaw)) ? 1
+              : (dCatRaw === "2" || /non.?deploy|restricted dut|injur/.test(dCatRaw)) ? 2
+              : (dCatRaw === "3" || /off.?team|second|attach/.test(dCatRaw)) ? 3
+              : null;
+      if (!cat) {
+        const t = dTypeRaw.toLowerCase();
+        cat = /second|attach|off.?team/.test(t) ? 3
+            : /injur|restricted dut/.test(t) ? 2
+            : 1;
+      }
+      deployment = { category: cat, type: dTypeRaw, endDate: parseSheetDate(rec.deployEnd) };
+    }
 
     people.push({
       firstName, lastName,
@@ -1059,7 +1123,7 @@ function parseEsectionRows(rows){
       hub,
       acting,
       resigned: parseBool(rec.resigned),
-      restriction,
+      deployment,
       startedDate: parseSheetDate(rec.startedDate),
       endDate: parseSheetDate(rec.endDate),
       capabilities: rec.capabilities,
@@ -1201,7 +1265,7 @@ function StoreProvider({ children }){
     addStaff: (s) => setStore(p => ({ ...p, staff: [...p.staff, { id: uid("stf"), createdAt: new Date().toISOString(), tags:[], inLatestImport: true, ...s }] })),
     addStaffBulk: (arr) => setStore(p => ({
       ...p,
-      staff: [...p.staff, ...arr.map(s => ({ id: uid("stf"), createdAt: new Date().toISOString(), tags:[], status: "Active", inLatestImport: true, ...s }))]
+      staff: [...p.staff, ...arr.map(s => ({ id: uid("stf"), createdAt: new Date().toISOString(), tags:[], deployment: null, inLatestImport: true, ...s }))]
     })),
     updateStaff: (id, patch) => setStore(p => ({ ...p, staff: p.staff.map(s => s.id===id ? { ...s, ...patch } : s) })),
     removeStaff: (id) => setStore(p => ({
@@ -1263,7 +1327,7 @@ function StoreProvider({ children }){
         inImport.add(u.id);
         const cols = new Set(u.after._present || []);
         const has = k => cols.has(k);
-        const hasRestriction = has("restrictionType") || has("restrictionEnd");
+        const hasDeployment = has("deployType") || has("deployCategory") || has("deployEnd");
         staff = staff.map(s => s.id === u.id ? {
           ...s,
           firstName: u.after.firstName || s.firstName,
@@ -1275,7 +1339,7 @@ function StoreProvider({ children }){
           hub:       has("hub")  ? (u.after.hub  || s.hub)  : s.hub,
           acting:    has("acting")   ? u.after.acting   : s.acting,
           resigned:  has("resigned") ? u.after.resigned : s.resigned,
-          restriction: hasRestriction ? u.after.restriction : s.restriction,
+          deployment: hasDeployment ? u.after.deployment : s.deployment,
           startedDate: has("startedDate") && u.after.startedDate != null ? u.after.startedDate : s.startedDate,
           endDate:   has("endDate") && u.after.endDate != null ? u.after.endDate : s.endDate,
           capabilities: { ...blankCapabilities(), ...s.capabilities, ...u.after.capabilities },
@@ -1290,7 +1354,7 @@ function StoreProvider({ children }){
         inImport.add(id);
         const { _present, ...clean } = a;   // drop the import-only column marker
         return upgradeStaff({
-          id, createdAt: now, tags: [], status: "Active",
+          id, createdAt: now, tags: [],
           ...clean, inLatestImport: true
         });
       });
@@ -1370,36 +1434,36 @@ function buildSampleStore(){
 
   // Worthing ~ 50.8133,-0.3714 | Horsham ~ 51.0625,-0.3303
   s.staff = [
-    { id:"stf_e01", firstName:"Anthony", lastName:"O'DONNELL", name:"Anthony O'DONNELL", warrantNumber:"EB142", role:"PC", team:"Investigations", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"yes",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"Leaving Feb", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(25), endDate: monthsAhead(1), lat:50.81832,lng:-0.3885, createdAt: monthsAgo(6) },
-    { id:"stf_e02", firstName:"Arisia", lastName:"COLYER-PATEL", name:"Arisia COLYER-PATEL", warrantNumber:"44309", role:"Police Staff", team:"Investigations", hub:"Horsham", acting:false, resigned:false, restriction:null, capabilities:{blues:"no",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(51), endDate: null, lat:51.0544,lng:-0.34026, createdAt: monthsAgo(6) },
-    { id:"stf_e03", firstName:"Declan", lastName:"SOUTHBY", name:"Declan SOUTHBY", warrantNumber:"EB028", role:"PC", team:"Investigations", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"yes",taser:"no",pursuit:"no",psu:"booked",moe:"no",dirfit:"no",ebti:"booked"}, note:"due to join drt", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(9), endDate: null, lat:50.82181,lng:-0.36504, createdAt: monthsAgo(6) },
-    { id:"stf_e04", firstName:"Joshua", lastName:"ZNISZCZOL", name:"Joshua ZNISZCZOL", warrantNumber:"EB107", role:"PC", team:"Investigations", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(46), endDate: null, lat:50.82742,lng:-0.38627, createdAt: monthsAgo(6) },
-    { id:"stf_e05", firstName:"Katrina", lastName:"BROWN DOUGLAS", name:"Katrina BROWN DOUGLAS", warrantNumber:"DB637", role:"PC", team:"Investigations", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(52), endDate: null, lat:50.81049,lng:-0.38833, createdAt: monthsAgo(6) },
-    { id:"stf_e06", firstName:"Robert", lastName:"ROLLINS", name:"Robert ROLLINS", warrantNumber:"", role:"PC", team:"Investigations", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(25), endDate: null, lat:50.80317,lng:-0.37121, createdAt: monthsAgo(6) },
-    { id:"stf_e07", firstName:"Ryan", lastName:"MARSH", name:"Ryan MARSH", warrantNumber:"EA790", role:"PC", team:"Investigations", hub:"Horsham", acting:false, resigned:false, restriction:{type:"Long-term sick",endDate: monthsAhead(4)}, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(59), endDate: null, lat:51.04546,lng:-0.34114, createdAt: monthsAgo(6) },
-    { id:"stf_e08", firstName:"Ryan", lastName:"WILLMER", name:"Ryan WILLMER", warrantNumber:"44977", role:"Police Staff", team:"Investigations", hub:"Horsham", acting:false, resigned:false, restriction:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(17), endDate: null, lat:51.0679,lng:-0.32868, createdAt: monthsAgo(6) },
-    { id:"stf_e09", firstName:"Samuel", lastName:"HUGHES", name:"Samuel HUGHES", warrantNumber:"EB159", role:"PC", team:"Investigations", hub:"Horsham", acting:false, resigned:false, restriction:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(13), endDate: null, lat:51.05244,lng:-0.32709, createdAt: monthsAgo(6) },
-    { id:"stf_e10", firstName:"Scott", lastName:"KENDALL", name:"Scott KENDALL", warrantNumber:"CK131", role:"Sergeant", team:"Investigations", hub:"Horsham", acting:false, resigned:false, restriction:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(30), endDate: null, lat:51.07364,lng:-0.34807, createdAt: monthsAgo(6) },
-    { id:"stf_e11", firstName:"Susannah", lastName:"BASSETT", name:"Susannah BASSETT", warrantNumber:"DT169", role:"Sergeant", team:"Investigations", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"Going February", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(37), endDate: monthsAhead(1), lat:50.82431,lng:-0.36427, createdAt: monthsAgo(6) },
-    { id:"stf_e12", firstName:"Tilly", lastName:"LANGHAM", name:"Tilly LANGHAM", warrantNumber:"EB194", role:"PC", team:"Investigations", hub:"Horsham", acting:false, resigned:false, restriction:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(13), endDate: null, lat:51.05675,lng:-0.3427, createdAt: monthsAgo(6) },
-    { id:"stf_e13", firstName:"Chloe", lastName:"HOLLAND-SKINNER", name:"Chloe HOLLAND-SKINNER", warrantNumber:"EB924", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"yes",taser:"unknown",pursuit:"unknown",psu:"yes",moe:"no",dirfit:"unknown",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(47), endDate: null, lat:50.82976,lng:-0.37728, createdAt: monthsAgo(6) },
-    { id:"stf_e14", firstName:"David", lastName:"SIMPSON", name:"David SIMPSON", warrantNumber:"CS254", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, restriction:{type:"Secondment",endDate: monthsAhead(8)}, capabilities:{blues:"yes",taser:"unknown",pursuit:"unknown",psu:"yes",moe:"yes",dirfit:"unknown",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(10), endDate: null, lat:50.79864,lng:-0.38592, createdAt: monthsAgo(6) },
-    { id:"stf_e15", firstName:"Amalie", lastName:"SMALL", name:"Amalie SMALL", warrantNumber:"EC001", role:"PC", team:"Response", hub:"Horsham", acting:false, resigned:false, restriction:null, capabilities:{blues:"no",taser:"no",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(22), endDate: null, lat:51.07501,lng:-0.32657, createdAt: monthsAgo(6) },
-    { id:"stf_e16", firstName:"Michael", lastName:"WHITE", name:"Michael WHITE", warrantNumber:"CW155", role:"Sergeant", team:"Response", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"yes",taser:"no",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(37), endDate: null, lat:50.82436,lng:-0.36313, createdAt: monthsAgo(6) },
-    { id:"stf_e17", firstName:"Amelia", lastName:"ROBERTS", name:"Amelia ROBERTS", warrantNumber:"DR913", role:"Sergeant", team:"Response", hub:"Horsham", acting:false, resigned:false, restriction:null, capabilities:{blues:"yes",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(50), endDate: null, lat:51.0638,lng:-0.31327, createdAt: monthsAgo(6) },
-    { id:"stf_e18", firstName:"Michael", lastName:"ALLENBY", name:"Michael ALLENBY", warrantNumber:"EC014", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"no",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"no"}, note:"leaving drt- direct dc", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(12), endDate: monthsAhead(3), lat:50.80893,lng:-0.36953, createdAt: monthsAgo(6) },
-    { id:"stf_e19", firstName:"Sara-Lucy", lastName:"CELINI", name:"Sara-Lucy CELINI", warrantNumber:"EB921", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"booked",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"yes"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(54), endDate: null, lat:50.82516,lng:-0.36713, createdAt: monthsAgo(6) },
-    { id:"stf_e20", firstName:"Jasmine", lastName:"DAY", name:"Jasmine DAY", warrantNumber:"EC112", role:"PC", team:"Response", hub:"Horsham", acting:false, resigned:false, restriction:null, capabilities:{blues:"no",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"no"}, note:"leaving -bluestone", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(48), endDate: monthsAhead(3), lat:51.07552,lng:-0.32752, createdAt: monthsAgo(6) },
-    { id:"stf_e21", firstName:"Daisy", lastName:"GOACHER", name:"Daisy GOACHER", warrantNumber:"EB419", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, restriction:{type:"Attachment",endDate: monthsAhead(2)}, capabilities:{blues:"no",taser:"no",pursuit:"no",psu:"booked",moe:"no",dirfit:"no",ebti:"no"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(57), endDate: null, lat:50.82066,lng:-0.38775, createdAt: monthsAgo(6) },
-    { id:"stf_e22", firstName:"Anna", lastName:"HENDRY", name:"Anna HENDRY", warrantNumber:"EC008", role:"PC", team:"Response", hub:"Horsham", acting:false, resigned:false, restriction:null, capabilities:{blues:"no",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"no"}, note:"leaving drt- direct dc", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(10), endDate: monthsAhead(3), lat:51.0527,lng:-0.33788, createdAt: monthsAgo(6) },
-    { id:"stf_e23", firstName:"Emma", lastName:"LACEY", name:"Emma LACEY", warrantNumber:"DL023", role:"Sergeant", team:"Response", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"yes",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"no"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(44), endDate: null, lat:50.79817,lng:-0.38102, createdAt: monthsAgo(6) },
-    { id:"stf_e24", firstName:"Nathalie", lastName:"MARRON", name:"Nathalie MARRON", warrantNumber:"DM089", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"yes",taser:"yes",pursuit:"no",psu:"yes",moe:"no",dirfit:"no",ebti:"no"}, note:"looking to leave", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(49), endDate: monthsAhead(3), lat:50.79894,lng:-0.37939, createdAt: monthsAgo(6) },
-    { id:"stf_e25", firstName:"Shane", lastName:"ROUT", name:"Shane ROUT", warrantNumber:"EB160", role:"PC", team:"Response", hub:"Horsham", acting:true, resigned:false, restriction:null, capabilities:{blues:"yes",taser:"no",pursuit:"yes",psu:"no",moe:"no",dirfit:"no",ebti:"yes"}, note:"Acting Sgt E section", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(23), endDate: null, lat:51.06738,lng:-0.33517, createdAt: monthsAgo(6) },
-    { id:"stf_e26", firstName:"James", lastName:"SAUNDERS", name:"James SAUNDERS", warrantNumber:"EB926", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"no",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"yes"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(35), endDate: null, lat:50.80863,lng:-0.38186, createdAt: monthsAgo(6) },
-    { id:"stf_e27", firstName:"Bradley", lastName:"SIMMS", name:"Bradley SIMMS", warrantNumber:"CS989", role:"Sergeant", team:"Response", hub:"Horsham", acting:false, resigned:false, restriction:{type:"Restricted/Suspended",endDate: monthsAhead(3)}, capabilities:{blues:"yes",taser:"yes",pursuit:"yes",psu:"no",moe:"no",dirfit:"yes",ebti:"yes"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(16), endDate: null, lat:51.05411,lng:-0.31458, createdAt: monthsAgo(6) },
-    { id:"stf_e28", firstName:"Lucie", lastName:"SMITH", name:"Lucie SMITH", warrantNumber:"EC182", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"no",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"booked"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(11), endDate: null, lat:50.81863,lng:-0.36747, createdAt: monthsAgo(6) },
-    { id:"stf_e29", firstName:"Catherine", lastName:"WATSON", name:"Catherine WATSON", warrantNumber:"EB214", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, restriction:null, capabilities:{blues:"yes",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"no"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(51), endDate: null, lat:50.80146,lng:-0.36315, createdAt: monthsAgo(6) },
-    { id:"stf_e30", firstName:"Luke", lastName:"HALL", name:"Luke HALL", warrantNumber:"EB531", role:"PC", team:"Response", hub:"Horsham", acting:false, resigned:false, restriction:null, capabilities:{blues:"booked",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"yes"}, note:"retruring to response", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(46), endDate: null, lat:51.05038,lng:-0.33464, createdAt: monthsAgo(6) }
+    { id:"stf_e01", firstName:"Anthony", lastName:"O'DONNELL", name:"Anthony O'DONNELL", warrantNumber:"EB142", role:"PC", team:"Investigations", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"yes",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"Leaving Feb", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(25), endDate: monthsAhead(1), lat:50.81832,lng:-0.3885, createdAt: monthsAgo(6) },
+    { id:"stf_e02", firstName:"Arisia", lastName:"COLYER-PATEL", name:"Arisia COLYER-PATEL", warrantNumber:"44309", role:"Police Staff", team:"Investigations", hub:"Horsham", acting:false, resigned:false, deployment:null, capabilities:{blues:"no",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(51), endDate: null, lat:51.0544,lng:-0.34026, createdAt: monthsAgo(6) },
+    { id:"stf_e03", firstName:"Declan", lastName:"SOUTHBY", name:"Declan SOUTHBY", warrantNumber:"EB028", role:"PC", team:"Investigations", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"yes",taser:"no",pursuit:"no",psu:"booked",moe:"no",dirfit:"no",ebti:"booked"}, note:"due to join drt", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(9), endDate: null, lat:50.82181,lng:-0.36504, createdAt: monthsAgo(6) },
+    { id:"stf_e04", firstName:"Joshua", lastName:"ZNISZCZOL", name:"Joshua ZNISZCZOL", warrantNumber:"EB107", role:"PC", team:"Investigations", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(46), endDate: null, lat:50.82742,lng:-0.38627, createdAt: monthsAgo(6) },
+    { id:"stf_e05", firstName:"Katrina", lastName:"BROWN DOUGLAS", name:"Katrina BROWN DOUGLAS", warrantNumber:"DB637", role:"PC", team:"Investigations", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(52), endDate: null, lat:50.81049,lng:-0.38833, createdAt: monthsAgo(6) },
+    { id:"stf_e06", firstName:"Robert", lastName:"ROLLINS", name:"Robert ROLLINS", warrantNumber:"", role:"PC", team:"Investigations", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(25), endDate: null, lat:50.80317,lng:-0.37121, createdAt: monthsAgo(6) },
+    { id:"stf_e07", firstName:"Ryan", lastName:"MARSH", name:"Ryan MARSH", warrantNumber:"EA790", role:"PC", team:"Investigations", hub:"Horsham", acting:false, resigned:false, deployment:{category:1,type:"Long-term sick",endDate: monthsAhead(4)}, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(59), endDate: null, lat:51.04546,lng:-0.34114, createdAt: monthsAgo(6) },
+    { id:"stf_e08", firstName:"Ryan", lastName:"WILLMER", name:"Ryan WILLMER", warrantNumber:"44977", role:"Police Staff", team:"Investigations", hub:"Horsham", acting:false, resigned:false, deployment:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(17), endDate: null, lat:51.0679,lng:-0.32868, createdAt: monthsAgo(6) },
+    { id:"stf_e09", firstName:"Samuel", lastName:"HUGHES", name:"Samuel HUGHES", warrantNumber:"EB159", role:"PC", team:"Investigations", hub:"Horsham", acting:false, resigned:false, deployment:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(13), endDate: null, lat:51.05244,lng:-0.32709, createdAt: monthsAgo(6) },
+    { id:"stf_e10", firstName:"Scott", lastName:"KENDALL", name:"Scott KENDALL", warrantNumber:"CK131", role:"Sergeant", team:"Investigations", hub:"Horsham", acting:false, resigned:false, deployment:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(30), endDate: null, lat:51.07364,lng:-0.34807, createdAt: monthsAgo(6) },
+    { id:"stf_e11", firstName:"Susannah", lastName:"BASSETT", name:"Susannah BASSETT", warrantNumber:"DT169", role:"Sergeant", team:"Investigations", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"Going February", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(37), endDate: monthsAhead(1), lat:50.82431,lng:-0.36427, createdAt: monthsAgo(6) },
+    { id:"stf_e12", firstName:"Tilly", lastName:"LANGHAM", name:"Tilly LANGHAM", warrantNumber:"EB194", role:"PC", team:"Investigations", hub:"Horsham", acting:false, resigned:false, deployment:null, capabilities:{blues:"unknown",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(13), endDate: null, lat:51.05675,lng:-0.3427, createdAt: monthsAgo(6) },
+    { id:"stf_e13", firstName:"Chloe", lastName:"HOLLAND-SKINNER", name:"Chloe HOLLAND-SKINNER", warrantNumber:"EB924", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"yes",taser:"unknown",pursuit:"unknown",psu:"yes",moe:"no",dirfit:"unknown",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(47), endDate: null, lat:50.82976,lng:-0.37728, createdAt: monthsAgo(6) },
+    { id:"stf_e14", firstName:"David", lastName:"SIMPSON", name:"David SIMPSON", warrantNumber:"CS254", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, deployment:{category:3,type:"Secondment",endDate: monthsAhead(8)}, capabilities:{blues:"yes",taser:"unknown",pursuit:"unknown",psu:"yes",moe:"yes",dirfit:"unknown",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(10), endDate: null, lat:50.79864,lng:-0.38592, createdAt: monthsAgo(6) },
+    { id:"stf_e15", firstName:"Amalie", lastName:"SMALL", name:"Amalie SMALL", warrantNumber:"EC001", role:"PC", team:"Response", hub:"Horsham", acting:false, resigned:false, deployment:null, capabilities:{blues:"no",taser:"no",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(22), endDate: null, lat:51.07501,lng:-0.32657, createdAt: monthsAgo(6) },
+    { id:"stf_e16", firstName:"Michael", lastName:"WHITE", name:"Michael WHITE", warrantNumber:"CW155", role:"Sergeant", team:"Response", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"yes",taser:"no",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(37), endDate: null, lat:50.82436,lng:-0.36313, createdAt: monthsAgo(6) },
+    { id:"stf_e17", firstName:"Amelia", lastName:"ROBERTS", name:"Amelia ROBERTS", warrantNumber:"DR913", role:"Sergeant", team:"Response", hub:"Horsham", acting:false, resigned:false, deployment:null, capabilities:{blues:"yes",taser:"unknown",pursuit:"unknown",psu:"no",moe:"no",dirfit:"no",ebti:"unknown"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(50), endDate: null, lat:51.0638,lng:-0.31327, createdAt: monthsAgo(6) },
+    { id:"stf_e18", firstName:"Michael", lastName:"ALLENBY", name:"Michael ALLENBY", warrantNumber:"EC014", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"no",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"no"}, note:"leaving drt- direct dc", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(12), endDate: monthsAhead(3), lat:50.80893,lng:-0.36953, createdAt: monthsAgo(6) },
+    { id:"stf_e19", firstName:"Sara-Lucy", lastName:"CELINI", name:"Sara-Lucy CELINI", warrantNumber:"EB921", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"booked",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"yes"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(54), endDate: null, lat:50.82516,lng:-0.36713, createdAt: monthsAgo(6) },
+    { id:"stf_e20", firstName:"Jasmine", lastName:"DAY", name:"Jasmine DAY", warrantNumber:"EC112", role:"PC", team:"Response", hub:"Horsham", acting:false, resigned:false, deployment:null, capabilities:{blues:"no",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"no"}, note:"leaving -bluestone", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(48), endDate: monthsAhead(3), lat:51.07552,lng:-0.32752, createdAt: monthsAgo(6) },
+    { id:"stf_e21", firstName:"Daisy", lastName:"GOACHER", name:"Daisy GOACHER", warrantNumber:"EB419", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, deployment:{category:3,type:"Attachment",endDate: monthsAhead(2)}, capabilities:{blues:"no",taser:"no",pursuit:"no",psu:"booked",moe:"no",dirfit:"no",ebti:"no"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(57), endDate: null, lat:50.82066,lng:-0.38775, createdAt: monthsAgo(6) },
+    { id:"stf_e22", firstName:"Anna", lastName:"HENDRY", name:"Anna HENDRY", warrantNumber:"EC008", role:"PC", team:"Response", hub:"Horsham", acting:false, resigned:false, deployment:null, capabilities:{blues:"no",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"no"}, note:"leaving drt- direct dc", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(10), endDate: monthsAhead(3), lat:51.0527,lng:-0.33788, createdAt: monthsAgo(6) },
+    { id:"stf_e23", firstName:"Emma", lastName:"LACEY", name:"Emma LACEY", warrantNumber:"DL023", role:"Sergeant", team:"Response", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"yes",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"no"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(44), endDate: null, lat:50.79817,lng:-0.38102, createdAt: monthsAgo(6) },
+    { id:"stf_e24", firstName:"Nathalie", lastName:"MARRON", name:"Nathalie MARRON", warrantNumber:"DM089", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"yes",taser:"yes",pursuit:"no",psu:"yes",moe:"no",dirfit:"no",ebti:"no"}, note:"looking to leave", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(49), endDate: monthsAhead(3), lat:50.79894,lng:-0.37939, createdAt: monthsAgo(6) },
+    { id:"stf_e25", firstName:"Shane", lastName:"ROUT", name:"Shane ROUT", warrantNumber:"EB160", role:"PC", team:"Response", hub:"Horsham", acting:true, resigned:false, deployment:null, capabilities:{blues:"yes",taser:"no",pursuit:"yes",psu:"no",moe:"no",dirfit:"no",ebti:"yes"}, note:"Acting Sgt E section", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(23), endDate: null, lat:51.06738,lng:-0.33517, createdAt: monthsAgo(6) },
+    { id:"stf_e26", firstName:"James", lastName:"SAUNDERS", name:"James SAUNDERS", warrantNumber:"EB926", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"no",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"yes"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(35), endDate: null, lat:50.80863,lng:-0.38186, createdAt: monthsAgo(6) },
+    { id:"stf_e27", firstName:"Bradley", lastName:"SIMMS", name:"Bradley SIMMS", warrantNumber:"CS989", role:"Sergeant", team:"Response", hub:"Horsham", acting:false, resigned:false, deployment:{category:1,type:"Restricted/Suspended",endDate: monthsAhead(3)}, capabilities:{blues:"yes",taser:"yes",pursuit:"yes",psu:"no",moe:"no",dirfit:"yes",ebti:"yes"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(16), endDate: null, lat:51.05411,lng:-0.31458, createdAt: monthsAgo(6) },
+    { id:"stf_e28", firstName:"Lucie", lastName:"SMITH", name:"Lucie SMITH", warrantNumber:"EC182", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"no",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"booked"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(11), endDate: null, lat:50.81863,lng:-0.36747, createdAt: monthsAgo(6) },
+    { id:"stf_e29", firstName:"Catherine", lastName:"WATSON", name:"Catherine WATSON", warrantNumber:"EB214", role:"PC", team:"Response", hub:"Worthing", acting:false, resigned:false, deployment:null, capabilities:{blues:"yes",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"no"}, note:"", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(51), endDate: null, lat:50.80146,lng:-0.36315, createdAt: monthsAgo(6) },
+    { id:"stf_e30", firstName:"Luke", lastName:"HALL", name:"Luke HALL", warrantNumber:"EB531", role:"PC", team:"Response", hub:"Horsham", acting:false, resigned:false, deployment:null, capabilities:{blues:"booked",taser:"no",pursuit:"no",psu:"no",moe:"no",dirfit:"no",ebti:"yes"}, note:"retruring to response", email:"",phone:"",tags:[], inLatestImport:true, startedDate: monthsAgo(46), endDate: null, lat:51.05038,lng:-0.33464, createdAt: monthsAgo(6) }
   ];
 
   // Tasks — a mix of regular tasks and chasers
@@ -1636,18 +1700,6 @@ function Pill({ children, tone = "neutral", className = "" }){
   return <span className={`pill ${tones[tone] || tones.neutral} ${className}`}>{children}</span>;
 }
 
-const STATUS_TONE = {
-  "Active": "success",
-  "On Leave": "amber",
-  "Training": "sky"
-};
-// Restriction pills — all amber-ish "needs watching" except suspension
-const RESTRICTION_TONE = {
-  "Secondment": "brand",
-  "Long-term sick": "rose",
-  "Attachment": "violet",
-  "Restricted/Suspended": "rose"
-};
 const PRIO_TONE = { high: "rose", medium: "amber", low: "neutral" };
 // Stable pill tone for a team, derived from its position in the configured team
 // list so renamed/extra teams (e.g. "Patrol"/"CID") still get a consistent colour
@@ -1658,14 +1710,14 @@ function teamTone(team, teams){
   return i < 0 ? "neutral" : TEAM_TONES[i % TEAM_TONES.length];
 }
 
-function StatusBadge({ value }){
-  return <Pill tone={STATUS_TONE[value] || "neutral"}>{value}</Pill>;
-}
-// A small pill for an active restriction, with its end date if known
-function RestrictionBadge({ restriction }){
-  if (!restriction || !restriction.type) return null;
-  const end = restriction.endDate ? ` · to ${fmt.date(restriction.endDate)}` : "";
-  return <Pill tone={RESTRICTION_TONE[restriction.type] || "amber"}>{restriction.type}{end}</Pill>;
+// Deployment badge — nothing for the default "Available", otherwise a pill
+// toned by category (red / amber / green) showing the sub-type (or category
+// short name) and end date if set.
+function DeploymentBadge({ deployment }){
+  const cat = deployment && DEPLOY_CAT_BY_ID[Number(deployment.category)];
+  if (!cat) return null;
+  const end = deployment.endDate ? ` · to ${fmt.date(deployment.endDate)}` : "";
+  return <Pill tone={cat.tone}>{deployment.type || cat.short}{end}</Pill>;
 }
 function PriorityBadge({ value }){
   return <Pill tone={PRIO_TONE[value] || "neutral"}>{value}</Pill>;
@@ -2004,10 +2056,10 @@ function Header({ view, onNav, query, onQuery, onMenu, onOpenPalette }){
   }
 
   const overdue = store.tasks.filter(t => !t.completed && t.dueDate && new Date(t.dueDate) < new Date(startOfDayIso())).length;
-  // Officers whose restriction ends within the next 30 days — they're due back on strength soon.
+  // Officers whose deployment status ends within the next 30 days — due back soon.
   const returningSoon = store.staff.filter(s => {
-    if (s.resigned || !s.restriction || !s.restriction.endDate) return false;
-    const days = daysBetween(startOfDayIso(), s.restriction.endDate);
+    if (s.resigned || !s.deployment || !s.deployment.endDate) return false;
+    const days = daysBetween(startOfDayIso(), s.deployment.endDate);
     return days != null && days >= 0 && days <= 30;
   }).length;
   const toggleTheme = () => setSetting("theme", store.settings.theme === "dark" ? "light" : "dark");
@@ -2135,8 +2187,13 @@ function buildStaffingSeries(staff, monthsBack = 12, monthsForward = 6){
     const monthEnd = new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 0, 23, 59, 59);
     if (started && started > monthEnd) return false;       // not yet joined
     if (ended && ended < monthStart) return false;          // already left
-    // off-strength while on a restriction that's still running at this month
-    if (isOnRestriction(s, monthEnd)) return false;
+    // off-strength while a strength-reducing deployment (Cat 1 or 3) is still
+    // running at this month. Cat 2 stays counted.
+    const c = deployCat(s);
+    if (c === 1 || c === 3) {
+      const de = s.deployment && s.deployment.endDate ? new Date(s.deployment.endDate) : null;
+      if (!de || de >= monthEnd) return false;
+    }
     return true;
   };
   const nowMonthIdx = monthsBack;  // index of the current month
@@ -2167,9 +2224,10 @@ function OverviewView({ onNav }){
   const overdueCount = todayItems.length - dueTodayCount;
 
   // --- KPIs ---
-  // On-strength = not resigned and not currently on a restriction
-  const activeStaff = staff.filter(s => !s.resigned && !isOnRestriction(s));
-  const restrictedStaff = staff.filter(s => !s.resigned && isOnRestriction(s));
+  // On strength = Available + Cat 2 (operational, non-deployable but at work).
+  // Reduced = Cat 1 (non-op) + Cat 3 (off-team). Resigned excluded from both.
+  const activeStaff = staff.filter(countsTowardStrength);
+  const restrictedStaff = staff.filter(isReduced);
   const totalPersonnel = activeStaff.length;
   const activeTasks = tasks.filter(t => !t.completed).length;
 
@@ -2269,11 +2327,11 @@ function OverviewView({ onNav }){
     .sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate))
     .slice(0, 6);
 
-  // Returning from a restriction within the next 60 days — back on strength soon.
+  // Returning from a deployment status within the next 60 days — back soon.
   const returningSoon = React.useMemo(() => {
     return staff
-      .filter(s => !s.resigned && s.restriction && s.restriction.type && s.restriction.endDate)
-      .map(s => ({ staff: s, days: daysBetween(startOfDayIso(), s.restriction.endDate) }))
+      .filter(s => !s.resigned && s.deployment && s.deployment.category && s.deployment.endDate)
+      .map(s => ({ staff: s, days: daysBetween(startOfDayIso(), s.deployment.endDate) }))
       .filter(x => x.days != null && x.days >= 0 && x.days <= 60)
       .sort((a, b) => a.days - b.days)
       .slice(0, 5);
@@ -2343,10 +2401,10 @@ function OverviewView({ onNav }){
                 className="w-full text-left flex items-center gap-3 px-4 py-3 rounded-xl bg-canvas dark:bg-ink-900/40 border border-softline dark:border-ink-800 hover:shadow-card transition">
           <Ic.alert width="18" height="18" className="text-ink-500 shrink-0"/>
           <div className="flex-1 text-[13px] text-ink-700 dark:text-ink-300">
-            <span className="font-semibold">{restrictedStaff.length}</span> on a restriction — secondment, long-term sick, attachment or suspension. Not counted in strength.
+            <span className="font-semibold">{restrictedStaff.length}</span> reducing numbers — non-operational (Cat 1) or off-team (Cat 3). Not counted in strength.
           </div>
           <div className="flex items-center gap-1.5">
-            {restrictedStaff.slice(0, 4).map(s => <RestrictionBadge key={s.id} restriction={s.restriction}/>)}
+            {restrictedStaff.slice(0, 4).map(s => <DeploymentBadge key={s.id} deployment={s.deployment}/>)}
             {restrictedStaff.length > 4 && <span className="text-[12px] text-ink-500">+{restrictedStaff.length - 4}</span>}
           </div>
         </button>
@@ -2434,7 +2492,7 @@ function OverviewView({ onNav }){
                     <Avatar name={p.name} photoId={p.photoId} size={32}/>
                     <div className="flex-1 min-w-0">
                       <div className="font-medium text-[13px] text-ink-900 dark:text-ink-100 truncate"><StaffNameLink staff={p}/></div>
-                      <div className="text-[11.5px] text-ink-500 truncate">{p.restriction.type} · ends {fmt.date(p.restriction.endDate)}</div>
+                      <div className="text-[11.5px] text-ink-500 truncate">{p.deployment.type || (DEPLOY_CAT_BY_ID[Number(p.deployment.category)] || {}).short} · ends {fmt.date(p.deployment.endDate)}</div>
                     </div>
                     <Pill tone={tone}>{days}d</Pill>
                   </div>
@@ -2462,8 +2520,8 @@ function StaffView({ query }){
   const [hubFilter, setHubFilter] = React.useState("all");          // Hub — active hubs only
   const [teamFilter, setTeamFilter] = React.useState("");           // Response/Investigations
   const [roleFilter, setRoleFilter] = React.useState("");
-  const [statusFilter, setStatusFilter] = React.useState("");
-  const [restrictionFilter, setRestrictionFilter] = React.useState("");  // "" | "any" | a type
+  // "" all · "available" · "1"/"2"/"3" category · "reduced" (Cat 1+3)
+  const [deployFilter, setDeployFilter] = React.useState("");
   const [sortBy, setSortBy] = React.useState({ key: "name", dir: "asc" });
   const [selectedId, setSelectedId] = React.useState(null);
   const [editing, setEditing] = React.useState(null);  // staff object or "new"
@@ -2478,15 +2536,14 @@ function StaffView({ query }){
     setHubFilter(f.hubFilter ?? "all");
     setTeamFilter(f.teamFilter ?? "");
     setRoleFilter(f.roleFilter ?? "");
-    setStatusFilter(f.statusFilter ?? "");
-    setRestrictionFilter(f.restrictionFilter ?? "");
+    setDeployFilter(f.deployFilter ?? "");
     setShowResigned(!!f.showResigned);
     setSortBy(f.sortBy || { key: "name", dir: "asc" });
   };
   const saveCurrentView = () => {
     const name = (prompt("Name this view") || "").trim();
     if (!name) return;
-    const filters = { hubFilter, teamFilter, roleFilter, statusFilter, restrictionFilter, showResigned, sortBy };
+    const filters = { hubFilter, teamFilter, roleFilter, deployFilter, showResigned, sortBy };
     const next = [...savedViews.filter(v => v.name !== name), { id: uid("vw"), name, filters }];
     setSetting("staffViews", next);
   };
@@ -2496,8 +2553,6 @@ function StaffView({ query }){
   useBusListener(Bus.staffQuick, () => setQuickOpen(true));
 
   const resignedCount = staff.filter(s => s.resigned).length;
-  const restrictionTypes = settings.restrictionTypes || RESTRICTION_TYPES;
-  const statuses = settings.statuses || STATUSES;
 
   const filtered = React.useMemo(() => {
     let arr = staff.filter(s => {
@@ -2505,10 +2560,13 @@ function StaffView({ query }){
       if (hubFilter !== "all" && s.hub !== hubFilter) return false;
       if (teamFilter && s.team !== teamFilter) return false;
       if (roleFilter && s.role !== roleFilter) return false;
-      if (statusFilter && s.status !== statusFilter) return false;
-      if (restrictionFilter === "any" && !(s.restriction && s.restriction.type)) return false;
-      if (restrictionFilter && restrictionFilter !== "any"
-          && (!s.restriction || s.restriction.type !== restrictionFilter)) return false;
+      if (deployFilter) {
+        const c = deployCat(s);
+        if (deployFilter === "available" && c !== null) return false;
+        else if (deployFilter === "reduced" && !(c === 1 || c === 3)) return false;
+        else if ((deployFilter === "1" || deployFilter === "2" || deployFilter === "3")
+                 && c !== Number(deployFilter)) return false;
+      }
       if (query) {
         const q = query.toLowerCase();
         return (s.name || "").toLowerCase().includes(q)
@@ -2523,13 +2581,14 @@ function StaffView({ query }){
     arr.sort((a, b) => {
       let av, bv;
       if (sortBy.key === "name") { av = (a.lastName || a.name || "").toLowerCase(); bv = (b.lastName || b.name || "").toLowerCase(); }
+      else if (sortBy.key === "deployment") { av = deployCat(a) || 0; bv = deployCat(b) || 0; }
       else { av = (a[sortBy.key] || "").toString().toLowerCase(); bv = (b[sortBy.key] || "").toString().toLowerCase(); }
       if (av < bv) return sortBy.dir === "asc" ? -1 : 1;
       if (av > bv) return sortBy.dir === "asc" ? 1 : -1;
       return 0;
     });
     return arr;
-  }, [staff, hubFilter, teamFilter, roleFilter, statusFilter, restrictionFilter, query, sortBy, showResigned]);
+  }, [staff, hubFilter, teamFilter, roleFilter, deployFilter, query, sortBy, showResigned]);
 
   const selected = staff.find(s => s.id === selectedId);
 
@@ -2576,11 +2635,16 @@ function StaffView({ query }){
         )}
         <Select value={teamFilter}   onChange={setTeamFilter}   placeholder="All teams"    options={settings.teams || TEAMS} className="w-40"/>
         <Select value={roleFilter}   onChange={setRoleFilter}   placeholder="All roles"    options={settings.roles || ROLES}    className="w-40"/>
-        <Select value={statusFilter} onChange={setStatusFilter} placeholder="All statuses" options={statuses} className="w-36"/>
-        <Select value={restrictionFilter} onChange={setRestrictionFilter} placeholder="All restrictions"
-                options={[{ value: "any", label: "Any restriction" }, ...restrictionTypes.map(t => ({ value: t, label: t }))]} className="w-44"/>
-        {(teamFilter || roleFilter || statusFilter || restrictionFilter) && (
-          <Button variant="ghost" size="sm" onClick={() => { setTeamFilter(""); setRoleFilter(""); setStatusFilter(""); setRestrictionFilter(""); }}>
+        <Select value={deployFilter} onChange={setDeployFilter} placeholder="All deployment"
+                options={[
+                  { value: "available", label: "Available" },
+                  { value: "1", label: "Cat 1 · Non-operational" },
+                  { value: "2", label: "Cat 2 · Op, non-deployable" },
+                  { value: "3", label: "Cat 3 · Off-team" },
+                  { value: "reduced", label: "Reducing numbers (1+3)" }
+                ]} className="w-52"/>
+        {(teamFilter || roleFilter || deployFilter) && (
+          <Button variant="ghost" size="sm" onClick={() => { setTeamFilter(""); setRoleFilter(""); setDeployFilter(""); }}>
             Reset
           </Button>
         )}
@@ -2608,7 +2672,7 @@ function StaffView({ query }){
                       { key: "role",   label: "Role",    cls: "text-left px-3 py-3" },
                       { key: "team",   label: "Team",    cls: "text-left px-3 py-3" },
                       { key: "hub",    label: "Hub",     cls: "text-left px-3 py-3" },
-                      { key: "status", label: "Status",  cls: "text-left px-3 py-3" }
+                      { key: "deployment", label: "Deployment", cls: "text-left px-3 py-3" }
                     ].map(col => {
                       const active = sortBy.key === col.key;
                       return (
@@ -2669,8 +2733,8 @@ function StaffView({ query }){
                         </td>
                         <td className="px-3 py-3">
                           <div className="flex flex-col gap-1 items-start">
-                            <StatusBadge value={s.status}/>
-                            {s.restriction && s.restriction.type && <RestrictionBadge restriction={s.restriction}/>}
+                            {deployCat(s) ? <DeploymentBadge deployment={s.deployment}/>
+                              : <span className="text-[12px] text-emerald-600 dark:text-emerald-400">Available</span>}
                           </div>
                         </td>
                         <td className="px-3 py-3">
@@ -2780,13 +2844,15 @@ function StaffDetail({ staff, onEdit, onRemove, onClose }){
           </div>
           <div className="text-[11.5px] text-ink-500 font-mono mt-0.5">Warrant {staff.warrantNumber || "—"}</div>
         </div>
-        <StatusBadge value={staff.status}/>
+        {deployCat(staff)
+          ? <DeploymentBadge deployment={staff.deployment}/>
+          : <Pill tone="success">Available</Pill>}
       </div>
 
-      {(staff.resigned || staff.inLatestImport === false || (staff.restriction && staff.restriction.type)) && (
+      {(staff.resigned || staff.inLatestImport === false || deployCat(staff)) && (
         <div className="flex flex-wrap gap-1.5 mb-4">
           {staff.resigned    && <Pill tone="rose">Resigned / moved team</Pill>}
-          {staff.restriction && staff.restriction.type && <RestrictionBadge restriction={staff.restriction}/>}
+          {deployCat(staff) && <DeploymentBadge deployment={staff.deployment}/>}
           {staff.inLatestImport === false && <Pill tone="amber">Not in latest import</Pill>}
         </div>
       )}
@@ -2832,10 +2898,11 @@ function StaffDetail({ staff, onEdit, onRemove, onClose }){
         <DetailRow label="Hub" value={hubArchived ? `${staff.hub} (archived)` : (staff.hub || "—")}/>
         <DetailRow label="Started" value={staff.startedDate ? fmt.date(staff.startedDate) : "—"}/>
         <DetailRow label="End date" value={staff.endDate ? fmt.date(staff.endDate) : "—"}/>
-        {staff.restriction && staff.restriction.type && (
+        {deployCat(staff) && (
           <>
-            <DetailRow label="Restriction" value={staff.restriction.type}/>
-            <DetailRow label="Restriction ends" value={staff.restriction.endDate ? fmt.date(staff.restriction.endDate) : "Ongoing"}/>
+            <DetailRow label="Deployment" value={(DEPLOY_CAT_BY_ID[deployCat(staff)] || {}).label}/>
+            {staff.deployment.type && <DetailRow label="Type" value={staff.deployment.type}/>}
+            <DetailRow label="Ends" value={staff.deployment.endDate ? fmt.date(staff.deployment.endDate) : "Ongoing"}/>
           </>
         )}
         <DetailRow label="Email" value={staff.email
@@ -2922,8 +2989,7 @@ function StaffForm({ staff, onSave, onCancel }){
   const teams = store.settings.teams || TEAMS;
   const allHubs = store.settings.hubs || HUBS;
   const archivedHubs = store.settings.archivedHubs || [];
-  const restrictionTypes = store.settings.restrictionTypes || RESTRICTION_TYPES;
-  const statuses = store.settings.statuses || STATUSES;
+  const deploymentTypes = store.settings.deploymentTypes || DEFAULT_DEPLOYMENT_TYPES;
   // Hub dropdown shows active hubs, plus this person's current hub even if archived
   const hubOptions = allHubs.filter(h => !archivedHubs.includes(h) || h === (staff && staff.hub));
 
@@ -2935,13 +3001,13 @@ function StaffForm({ staff, onSave, onCancel }){
     team: teams.includes(staff.team) ? staff.team : teams[0],
     hub: staff.hub || hubOptions[0] || "Worthing",
     acting: !!staff.acting,
-    status: staff.status || "Active",
     resigned: !!staff.resigned,
     startedDate: staff.startedDate || "",
     endDate: staff.endDate || "",
-    // Restriction: a type ("" = none) plus an end date
-    restrictionType: (staff.restriction && staff.restriction.type) || "",
-    restrictionEnd: (staff.restriction && staff.restriction.endDate) || "",
+    // Deployment: category 0 = Available (default), else 1/2/3 + optional sub-type + end date
+    deployCategory: (staff.deployment && Number(staff.deployment.category)) || 0,
+    deployType: (staff.deployment && staff.deployment.type) || "",
+    deployEnd: (staff.deployment && staff.deployment.endDate) || "",
     photoId: staff.photoId || null,
     email: staff.email || "",
     phone: staff.phone || "",
@@ -2951,8 +3017,8 @@ function StaffForm({ staff, onSave, onCancel }){
   } : {
     firstName: "", lastName: "", warrantNumber: "",
     role: roles[0] || "PC", team: teams[0], hub: hubOptions[0] || "Worthing", acting: false,
-    status: "Active", resigned: false, startedDate: "", endDate: "",
-    restrictionType: "", restrictionEnd: "",
+    resigned: false, startedDate: "", endDate: "",
+    deployCategory: 0, deployType: "", deployEnd: "",
     photoId: null,
     email: "",
     phone: "", capabilities: blankCapabilities(), tags: [], note: ""
@@ -2986,16 +3052,17 @@ function StaffForm({ staff, onSave, onCancel }){
   const submit = () => {
     if (!valid) return;
     const name = (form.firstName.trim() + " " + form.lastName.trim()).trim();
-    // Build the restriction object — null if no type chosen
-    const restriction = form.restrictionType
-      ? { type: form.restrictionType, endDate: form.restrictionEnd ? new Date(form.restrictionEnd).toISOString() : null }
+    // Build the deployment object — null (Available) when category 0.
+    const cat = Number(form.deployCategory) || 0;
+    const deployment = cat
+      ? { category: cat, type: form.deployType || "", endDate: form.deployEnd ? new Date(form.deployEnd).toISOString() : null }
       : null;
     // Strip the flat form-helper fields so they don't pollute the staff record
-    const { restrictionType, restrictionEnd, ...rest } = form;
+    const { deployCategory, deployType, deployEnd, ...rest } = form;
     onSave({
       ...rest,
       name,
-      restriction,
+      deployment,
       startedDate: form.startedDate ? new Date(form.startedDate).toISOString() : null,
       endDate: form.endDate ? new Date(form.endDate).toISOString() : null
     });
@@ -3069,9 +3136,6 @@ function StaffForm({ staff, onSave, onCancel }){
           <Select value={form.hub} onChange={v => set("hub", v)} options={hubOptions}/>
           {archivedHubs.includes(form.hub) && <div className="text-[11px] text-amber2-600 mt-1">This hub is archived.</div>}
         </Field>
-        <Field label="Status">
-          <Select value={form.status} onChange={v => set("status", v)} options={statuses}/>
-        </Field>
         <Field label="Started date (optional)">
           <Input type="date" value={fmt.dateInput(form.startedDate)} onChange={v => set("startedDate", v)}/>
         </Field>
@@ -3097,19 +3161,30 @@ function StaffForm({ staff, onSave, onCancel }){
           </Field>
         </div>
 
-        {/* Restriction — secondment, long-term sick, attachment, restricted/suspended */}
+        {/* Deployment status — Available (default) or one of the 3 categories */}
         <div className="sm:col-span-2">
-          <Field label="Restriction / absence">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              <Select value={form.restrictionType} onChange={v => set("restrictionType", v)}
-                      options={["", ...restrictionTypes]} placeholder="None"/>
-              <Input type="date" value={fmt.dateInput(form.restrictionEnd)} onChange={v => set("restrictionEnd", v)}
-                     disabled={!form.restrictionType}/>
+          <Field label="Deployment status">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <Select value={String(form.deployCategory || 0)}
+                      onChange={v => setForm(p => ({ ...p, deployCategory: Number(v), deployType: "", deployEnd: Number(v) ? p.deployEnd : "" }))}
+                      options={[
+                        { value: "0", label: "Available (on team)" },
+                        { value: "1", label: "Cat 1 · Non-operational, non-deployable" },
+                        { value: "2", label: "Cat 2 · Operational, non-deployable" },
+                        { value: "3", label: "Cat 3 · Operational, off-team" }
+                      ]}/>
+              <Select value={form.deployType} onChange={v => set("deployType", v)}
+                      options={["", ...((deploymentTypes[form.deployCategory] || []))]}
+                      placeholder={form.deployCategory ? "Type (optional)" : "—"}
+                      className={form.deployCategory ? "" : "opacity-50 pointer-events-none"}/>
+              <Input type="date" value={fmt.dateInput(form.deployEnd)} onChange={v => set("deployEnd", v)}
+                     disabled={!form.deployCategory}/>
             </div>
             <div className="text-[11px] text-ink-500 mt-1.5">
-              {form.restrictionType
-                ? "On a restriction — kept in the list but not counted toward active strength until the end date."
-                : "Leave as None unless they're seconded, on long-term sick, on attachment, or restricted/suspended."}
+              {Number(form.deployCategory) === 1 ? "Non-operational, non-deployable (e.g. suspended, long-term sick) — reduces available numbers."
+                : Number(form.deployCategory) === 2 ? "Operational but not deployable (e.g. injured, at work) — still counted in numbers."
+                : Number(form.deployCategory) === 3 ? "Operational and fine but not on your team (e.g. secondment, attachment) — reduces available numbers."
+                : "Available: on the team, operational and deployable. Counts toward full strength."}
             </div>
           </Field>
         </div>
@@ -3238,7 +3313,7 @@ function QuickAddStaff({ onClose, onSave }){
       team:          r.team,
       hub:           r.hub,
       acting:        r.acting,
-      status:        "Active",
+      deployment:    null,
       resigned:      r.resigned,
       startedDate:   null,
       endDate:       null,
@@ -3474,7 +3549,7 @@ function MapView(){
 
           {activeHubs.map(hub => {
             const list = byHub[hub] || [];
-            const active = list.filter(s => s.status === "Active").length;
+            const deployable = list.filter(s => !s.resigned && deployCat(s) === null).length;
             return (
               <Card key={hub} title={hub} eyebrow={`${list.length} staff`}>
                 <div className="space-y-1">
@@ -3486,14 +3561,16 @@ function MapView(){
                         <div className="text-[12.5px] font-medium truncate"><StaffNameLink staff={s}/></div>
                         <div className="text-[11px] text-ink-500 truncate">{s.role} · {s.team || "—"}</div>
                       </div>
-                      <StatusBadge value={s.status}/>
+                      {deployCat(s)
+                        ? <DeploymentBadge deployment={s.deployment}/>
+                        : <Pill tone="success">Available</Pill>}
                     </div>
                   ))}
                   {list.length > 8 && <div className="text-[11.5px] text-ink-500 pt-1 pl-1">+{list.length - 8} more</div>}
                 </div>
                 <div className="mt-3 pt-3 border-t border-softline dark:border-ink-800 flex items-center justify-between text-[11.5px]">
-                  <span className="text-ink-500">Active right now</span>
-                  <span className="font-semibold text-emerald-600 tnum">{active}/{list.length}</span>
+                  <span className="text-ink-500">Deployable now</span>
+                  <span className="font-semibold text-emerald-600 tnum">{deployable}/{list.length}</span>
                 </div>
               </Card>
             );
@@ -4379,6 +4456,14 @@ function ImportView({ onNav }){
     if (has("hub")) cmp("Hub", before.hub, after.hub);
     if (has("acting") && before.acting !== after.acting) changes.push(`Acting: ${before.acting ? "yes" : "no"} → ${after.acting ? "yes" : "no"}`);
     if (has("resigned") && before.resigned !== after.resigned) changes.push(`Resigned/moved: ${before.resigned ? "yes" : "no"} → ${after.resigned ? "yes" : "no"}`);
+    if (has("deployType") || has("deployCategory") || has("deployEnd")) {
+      const fmtDep = d => {
+        const c = d && DEPLOY_CAT_BY_ID[Number(d.category)];
+        return c ? `Cat ${c.id}${d.type ? " · " + d.type : ""}` : "Available";
+      };
+      const b = fmtDep(before.deployment), a = fmtDep(after.deployment);
+      if (b !== a) changes.push(`Deployment: ${b} → ${a}`);
+    }
     // capability deltas — only for capability columns that were in the sheet
     CAPABILITIES.forEach(cap => {
       const a = (after.capabilities || {})[cap.key];
@@ -4614,15 +4699,17 @@ function ReportsView(){
     return Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 10);
   }, [filteredStaff]);
 
-  // Restriction breakdown — resigned/moved are excluded since they're a separate concern
+  // Deployment split — counted (Available + Cat 2) vs reducing numbers
+  // (Cat 1 + Cat 3). Resigned/moved excluded (separate concern).
   const restrictionSplit = React.useMemo(() => {
     const live = filteredStaff.filter(s => !s.resigned);
-    const restricted = live.filter(s => isOnRestriction(s));
-    const free = live.filter(s => !isOnRestriction(s));
-    // Per-type count for the donut
+    const restricted = live.filter(isReduced);
+    const free = live.filter(countsTowardStrength);
+    // Per sub-type (or category short name) count for the donut
     const byType = {};
     restricted.forEach(s => {
-      const t = s.restriction && s.restriction.type;
+      const cat = DEPLOY_CAT_BY_ID[deployCat(s)];
+      const t = (s.deployment && s.deployment.type) || (cat && cat.short);
       if (t) byType[t] = (byType[t] || 0) + 1;
     });
     return {
@@ -4652,9 +4739,9 @@ function ReportsView(){
           sec.push(["By role"], ["Role","Count"], ...Object.entries(byRole), []);
           sec.push(["By hub"], ["Hub","Count"], ...Object.entries(byHub), []);
           sec.push(["Open tasks by category"], ["Category","Count"], ...Object.entries(tasksByCategory), []);
-          sec.push(["Restriction split"], ["State","Count"],
-            ["Available", restrictionSplit.free], ["Restricted", restrictionSplit.restricted], []);
-          sec.push(["Restrictions by type"], ["Type","Count"], ...Object.entries(restrictionSplit.byType));
+          sec.push(["Deployment split"], ["State","Count"],
+            ["Counted", restrictionSplit.free], ["Reducing", restrictionSplit.restricted], []);
+          sec.push(["Reductions by type"], ["Type","Count"], ...Object.entries(restrictionSplit.byType));
           const csv = sec.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
           const blob = new Blob([csv], { type: "text/csv" });
           const a = document.createElement("a");
@@ -4714,15 +4801,15 @@ function ReportsView(){
           )}
         </Card>
 
-        <Card title="Restricted vs not restricted" eyebrow="Headline split of who's available">
+        <Card title="Counted vs reducing numbers" eyebrow="Available + Cat 2 vs Cat 1 + Cat 3">
           <div className="grid grid-cols-2 gap-3 mb-4">
             <div className="text-center p-3 rounded-xl bg-emerald-50 dark:bg-emerald-900/20">
-              <div className="text-[11px] text-ink-500 uppercase tracking-wider mb-1">Available</div>
+              <div className="text-[11px] text-ink-500 uppercase tracking-wider mb-1">Counted</div>
               <div className="font-display font-extrabold text-[28px] tnum text-emerald-600 leading-none">{restrictionSplit.free}</div>
               <div className="text-[11.5px] text-ink-500 mt-1">{restrictionSplit.total > 0 ? `${100 - restrictionSplit.pct}% of strength` : "—"}</div>
             </div>
             <div className="text-center p-3 rounded-xl bg-rose-50 dark:bg-rose-900/20">
-              <div className="text-[11px] text-ink-500 uppercase tracking-wider mb-1">Restricted</div>
+              <div className="text-[11px] text-ink-500 uppercase tracking-wider mb-1">Reducing</div>
               <div className="font-display font-extrabold text-[28px] tnum text-rose-600 leading-none">{restrictionSplit.restricted}</div>
               <div className="text-[11.5px] text-ink-500 mt-1">{restrictionSplit.total > 0 ? `${restrictionSplit.pct}% of strength` : "—"}</div>
             </div>
@@ -4735,9 +4822,9 @@ function ReportsView(){
           )}
         </Card>
 
-        <Card title="Restrictions by type">
+        <Card title="Reductions by type">
           {Object.keys(restrictionSplit.byType).length === 0 ? (
-            <div className="py-8 text-center text-[13px] text-ink-500">No one is currently on a restriction.</div>
+            <div className="py-8 text-center text-[13px] text-ink-500">Nobody is reducing the numbers right now.</div>
           ) : (
             <>
               <ChartView type="doughnut"
@@ -4751,7 +4838,10 @@ function ReportsView(){
               {/* Names under each type — small font, scannable */}
               <div className="mt-3 space-y-1.5 text-[12px]">
                 {Object.keys(restrictionSplit.byType).map(t => {
-                  const names = restrictionSplit.list.filter(s => s.restriction && s.restriction.type === t);
+                  const names = restrictionSplit.list.filter(s => {
+                    const cat = DEPLOY_CAT_BY_ID[deployCat(s)];
+                    return ((s.deployment && s.deployment.type) || (cat && cat.short)) === t;
+                  });
                   return (
                     <div key={t} className="flex gap-2">
                       <span className="font-semibold text-ink-700 dark:text-ink-300 shrink-0">{t}</span>
@@ -4810,7 +4900,7 @@ function SettingsView({ onNav }){
   const exportExcel = () => {
     if (typeof XLSX === "undefined") { alert("Spreadsheet library didn't load — check your connection."); return; }
     const headers = ["Name","Warrant","Role","Team","Hub","Acting","Resigned/Moved",
-                     "Restriction","Restriction End","Started","End",
+                     "Deployment Category","Deployment Type","Deployment End","Started","End",
                      "Blues","Taser","Pursuit","PSU","MOE","Dirfit","EBTI","Note"];
     const capOrder = ["blues","taser","pursuit","psu","moe","dirfit","ebti"];
     const capLabel = v => ({yes:"Yes",no:"No",booked:"Booked",unknown:""}[v] || "");
@@ -4826,8 +4916,9 @@ function SettingsView({ onNav }){
         s.hub || "",
         s.acting ? "Yes" : "",
         s.resigned ? "Yes" : "",
-        (s.restriction && s.restriction.type) || "",
-        (s.restriction && s.restriction.endDate) ? dateStr(s.restriction.endDate) : "",
+        deployCat(s) || "",
+        (s.deployment && s.deployment.type) || "",
+        (s.deployment && s.deployment.endDate) ? dateStr(s.deployment.endDate) : "",
         dateStr(s.startedDate),
         dateStr(s.endDate),
         ...capOrder.map(c => capLabel(caps[c])),
@@ -4836,7 +4927,7 @@ function SettingsView({ onNav }){
     });
     const ws = XLSX.utils.aoa_to_sheet(rows);
     // Column widths so the export looks tidy on open
-    ws['!cols'] = [{wch:22},{wch:10},{wch:14},{wch:14},{wch:12},{wch:9},{wch:15},{wch:18},{wch:15},{wch:12},{wch:12},{wch:8},{wch:8},{wch:9},{wch:7},{wch:7},{wch:8},{wch:8},{wch:28}];
+    ws['!cols'] = [{wch:22},{wch:10},{wch:14},{wch:14},{wch:12},{wch:9},{wch:15},{wch:14},{wch:18},{wch:15},{wch:12},{wch:12},{wch:8},{wch:8},{wch:9},{wch:7},{wch:7},{wch:8},{wch:8},{wch:28}];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Staff");
     const teamName = (store.settings.teamName || "staff").replace(/[^A-Za-z0-9]+/g, "-").toLowerCase();
@@ -5155,8 +5246,7 @@ function SettingsView({ onNav }){
 
         <ListEditor title="Teams" listKey="teams" items={store.settings.teams} onAdd={(v) => addToList("teams", v)} onRemove={(v) => removeFromList("teams", v)}/>
         <ListEditor title="Roles" listKey="roles" items={store.settings.roles} onAdd={(v) => addToList("roles", v)} onRemove={(v) => removeFromList("roles", v)}/>
-        <ListEditor title="Availability statuses" listKey="statuses" items={store.settings.statuses} onAdd={(v) => addToList("statuses", v)} onRemove={(v) => removeFromList("statuses", v)}/>
-        <ListEditor title="Restriction types" eyebrow="Secondment, long-term sick, attachment, restricted/suspended — each carries an end date" listKey="restrictionTypes" items={store.settings.restrictionTypes} onAdd={(v) => addToList("restrictionTypes", v)} onRemove={(v) => removeFromList("restrictionTypes", v)}/>
+        <DeploymentTypesEditor/>
         <ListEditor title="Skills" listKey="tags" items={store.settings.tags} onAdd={(v) => addToList("tags", v)} onRemove={(v) => removeFromList("tags", v)}/>
         <ListEditor title="Task categories" listKey="categories" items={store.settings.categories} onAdd={(v) => addToList("categories", v)} onRemove={(v) => removeFromList("categories", v)}/>
 
@@ -5264,6 +5354,53 @@ function SettingsView({ onNav }){
         </Card>
       </div>
     </div>
+  );
+}
+
+// Editor for the three deployment-status sub-type lists (Cat 1/2/3).
+function DeploymentTypesEditor(){
+  const { store, setSetting } = useStore();
+  const dt = store.settings.deploymentTypes || DEFAULT_DEPLOYMENT_TYPES;
+  const [vals, setVals] = React.useState({ 1: "", 2: "", 3: "" });
+  const add = (cat) => {
+    const v = (vals[cat] || "").trim();
+    if (!v) return;
+    const list = Array.isArray(dt[cat]) ? dt[cat] : [];
+    if (list.includes(v)) { setVals(s => ({ ...s, [cat]: "" })); return; }
+    setSetting("deploymentTypes", { ...dt, [cat]: [...list, v] });
+    setVals(s => ({ ...s, [cat]: "" }));
+  };
+  const remove = (cat, v) => setSetting("deploymentTypes", { ...dt, [cat]: (dt[cat] || []).filter(x => x !== v) });
+  return (
+    <Card title="Deployment status types" eyebrow="Sub-types for each category — each instance also carries an end date" className="lg:col-span-2">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {DEPLOY_CATS.map(c => (
+          <div key={c.id}>
+            <div className="flex items-center gap-2 mb-2">
+              <Pill tone={c.tone}>Cat {c.id}</Pill>
+              <span className="text-[12px] font-semibold text-ink-700 dark:text-ink-300">{c.label}</span>
+            </div>
+            <div className="text-[11px] text-ink-500 mb-2">{c.reduces ? "Reduces available numbers." : "Still counted in numbers."}</div>
+            <div className="flex gap-2 mb-2">
+              <input value={vals[c.id]} onChange={e => setVals(s => ({ ...s, [c.id]: e.target.value }))}
+                     onKeyDown={e => { if (e.key === "Enter") add(c.id); }}
+                     placeholder="Add type…" aria-label={`Add a Cat ${c.id} type`}
+                     className="flex-1 px-3 py-2 text-[13px] rounded-xl"/>
+              <Button size="sm" onClick={() => add(c.id)} disabled={!(vals[c.id] || "").trim()}><Ic.plus width="13" height="13"/></Button>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {(dt[c.id] || []).map(it => (
+                <span key={it} className="pill bg-canvas dark:bg-ink-900/40 text-ink-700 dark:text-ink-300 gap-1.5 border border-softline dark:border-ink-800">
+                  {it}
+                  <button onClick={() => remove(c.id, it)} aria-label={`Remove ${it}`} className="hover:text-rose-500 transition"><Ic.x width="11" height="11"/></button>
+                </span>
+              ))}
+              {(!dt[c.id] || dt[c.id].length === 0) && <div className="text-[12px] text-ink-400">No types.</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </Card>
   );
 }
 
