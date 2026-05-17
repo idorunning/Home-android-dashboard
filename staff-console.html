@@ -494,13 +494,11 @@ const DEFAULT_STORE = () => ({
     ownerName: "",
     // Logo: an IndexedDB key. Blob lives outside localStorage so it doesn't bloat saves.
     logoId: null,
-    // Colour palette — three zones, each can be a preset name or "custom".
-    // The CSS variables --c-header / --c-sidebar / --c-accent drive the live render.
+    // Accent highlight only — buttons, links, active nav, charts. The surfaces
+    // (header/sidebar) are no longer themed; this is light personalisation.
     palette: {
       preset: "default",       // "default" | preset name | "custom"
-      header:  "#FFFFFF",      // header bar
-      sidebar: "#FFFFFF",      // sidebar background
-      accent:  "#5765E0"       // primary brand colour — buttons, active states, charts
+      accent:  "#5765E0"
     },
     teams: ["Response", "Investigations"],
     hubs: ["Worthing", "Horsham"],
@@ -710,11 +708,15 @@ function ensureCurrent(store){
   if (typeof next.settings.teamName !== "string")  next.settings.teamName  = "";
   if (typeof next.settings.ownerName !== "string") next.settings.ownerName = "";
   if (next.settings.logoId === undefined) next.settings.logoId = null;
-  // Palette — three zones with safe fallbacks
+  // Palette — accent only now. Keep a customised accent; drop the retired
+  // header/sidebar surface colours from older stores.
   if (!next.settings.palette || typeof next.settings.palette !== "object") {
-    next.settings.palette = def.settings.palette;
+    next.settings.palette = { ...def.settings.palette };
   } else {
-    next.settings.palette = { ...def.settings.palette, ...next.settings.palette };
+    next.settings.palette = {
+      preset: next.settings.palette.preset || "default",
+      accent: next.settings.palette.accent || def.settings.palette.accent
+    };
   }
   // drop dead settings keys
   delete next.settings.departments;
@@ -1236,15 +1238,12 @@ function StoreProvider({ children }){
     else root.classList.remove("dark");
   }, [store.settings.theme]);
 
-  // Palette application — pushes the three zone colours into CSS variables so any
-  // rule referencing var(--c-header), var(--c-sidebar) or var(--c-accent) updates live.
-  // Also derives a couple of accent shades (soft tint, contrast text) used by buttons/pills.
+  // Palette application — only the accent. Surfaces (header/sidebar) keep the
+  // default card colour; the accent drives buttons, links, active nav, charts.
   React.useEffect(() => {
     const p = store.settings.palette;
     if (!p) return;
     const root = document.documentElement;
-    root.style.setProperty("--c-header",  p.header  || "#FFFFFF");
-    root.style.setProperty("--c-sidebar", p.sidebar || "#FFFFFF");
     root.style.setProperty("--c-accent",  p.accent  || "#5765E0");
     // Soft tint of accent (used for hover bg) — naive 12% alpha applied via rgba
     const hexToRgb = h => {
@@ -1858,15 +1857,16 @@ function TagInput({ value = [], onChange, suggestions = [], placeholder = "Add t
    ========================================================================= */
 const CHART_PALETTE = ["#5765E0","#9B7CF0","#3A86F0","#0EAB94","#E89A1C","#E84D6B","#7C8BF7","#B8A2FA"];
 
-// Pre-set palettes for the three-zone colour picker. Each defines header, sidebar
-// and accent colours; users can also pick "custom" and set each independently.
+// Accent-only swatches for light personalisation (just the highlight colour;
+// surfaces stay the default card colour). Users can also set a custom hex.
 const PALETTE_PRESETS = [
-  { id: "default",  label: "Default",       header: "#FFFFFF", sidebar: "#FFFFFF", accent: "#5765E0" },
-  { id: "navy",     label: "Police navy",   header: "#0B2447", sidebar: "#0B2447", accent: "#FFB200" },
-  { id: "slate",    label: "Slate",         header: "#1E293B", sidebar: "#1E293B", accent: "#38BDF8" },
-  { id: "forest",   label: "Forest",        header: "#FFFFFF", sidebar: "#F5F7F4", accent: "#2F855A" },
-  { id: "burgundy", label: "Burgundy",      header: "#FFFFFF", sidebar: "#FDF2F2", accent: "#9D174D" },
-  { id: "graphite", label: "Graphite",      header: "#F8F9FB", sidebar: "#EDF0F4", accent: "#374151" }
+  { id: "default",  label: "Indigo",   accent: "#5765E0" },
+  { id: "violet",   label: "Violet",   accent: "#7F5AE0" },
+  { id: "sky",      label: "Sky",      accent: "#2A6CCC" },
+  { id: "teal",     label: "Teal",     accent: "#0A8F7C" },
+  { id: "forest",   label: "Forest",   accent: "#2F855A" },
+  { id: "burgundy", label: "Burgundy", accent: "#9D174D" },
+  { id: "slate",    label: "Slate",    accent: "#374151" }
 ];
 
 function ChartView({ type, data, options, height = 240 }){
@@ -1960,8 +1960,7 @@ function Sidebar({ active, onNav, collapsed, onToggleCollapse }){
   const { store } = useStore();
   const overdue = store.tasks.filter(t => !t.completed && t.dueDate && new Date(t.dueDate) < new Date(startOfDayIso())).length;
   return (
-    <aside style={{ background: "var(--c-sidebar, var(--card-bg, #fff))" }}
-           className={`relative border-r border-softline dark:border-ink-800/60 transition-all ${collapsed ? "w-[76px]" : "w-[244px]"} flex flex-col shrink-0`}>
+    <aside className={`relative bg-card border-r border-softline dark:border-ink-800/60 transition-all ${collapsed ? "w-[76px]" : "w-[244px]"} flex flex-col shrink-0`}>
       {/* Floating toggle — always visible, sits on the right edge */}
       <button onClick={onToggleCollapse}
               title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
@@ -2079,8 +2078,7 @@ function Header({ view, onNav, query, onQuery, onMenu, onOpenPalette }){
   ) : null;
 
   return (
-    <header style={{ background: "var(--c-header, var(--card-bg, #fff))" }}
-            className="border-b border-softline dark:border-ink-800/60 px-8 py-4 shrink-0">
+    <header className="bg-card border-b border-softline dark:border-ink-800/60 px-8 py-4 shrink-0">
       <div className="flex items-center justify-between gap-6 flex-wrap">
         <div className="min-w-0 flex items-center gap-3">
           <button onClick={onMenu} aria-label="Open navigation menu"
@@ -5083,23 +5081,19 @@ function SettingsView({ onNav }){
           </div>
         </Card>
 
-        <Card title="Colour palette" eyebrow="Three zones — header, sidebar, accent">
+        <Card title="Accent colour" eyebrow="Light personalisation — highlights only">
           <div className="space-y-4">
             <div>
               <div className="text-[11.5px] text-ink-500 mb-2 font-semibold uppercase tracking-wider">Presets</div>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="flex flex-wrap gap-2">
                 {PALETTE_PRESETS.map(preset => {
-                  const active = (store.settings.palette || {}).preset === preset.id;
+                  const active = (store.settings.palette || {}).accent === preset.accent;
                   return (
-                    <button key={preset.id}
-                            onClick={() => setPalette({ preset: preset.id, header: preset.header, sidebar: preset.sidebar, accent: preset.accent })}
-                            className={`p-2 rounded-xl border-2 transition ${active ? "border-brand-400" : "border-softline hover:border-brand-300 dark:border-ink-800"}`}>
-                      <div className="flex gap-1 mb-1.5">
-                        <span className="flex-1 h-5 rounded-l" style={{ background: preset.header }}/>
-                        <span className="flex-1 h-5" style={{ background: preset.sidebar }}/>
-                        <span className="flex-1 h-5 rounded-r" style={{ background: preset.accent }}/>
-                      </div>
-                      <div className="text-[11px] font-semibold text-ink-700 dark:text-ink-300">{preset.label}</div>
+                    <button key={preset.id} aria-label={preset.label} aria-pressed={active}
+                            onClick={() => setPalette({ preset: preset.id, accent: preset.accent })}
+                            className={`flex items-center gap-2 pl-1.5 pr-3 py-1.5 rounded-xl border-2 transition ${active ? "border-brand-400" : "border-softline hover:border-brand-300 dark:border-ink-800"}`}>
+                      <span className="w-6 h-6 rounded-lg" style={{ background: preset.accent }}/>
+                      <span className="text-[12px] font-semibold text-ink-700 dark:text-ink-300">{preset.label}</span>
                     </button>
                   );
                 })}
@@ -5107,46 +5101,32 @@ function SettingsView({ onNav }){
             </div>
 
             <div className="pt-3 border-t border-softline dark:border-ink-800">
-              <div className="text-[11.5px] text-ink-500 mb-2 font-semibold uppercase tracking-wider">Custom — pick each zone</div>
-              <div className="grid grid-cols-3 gap-3">
-                {[
-                  { key: "header",  label: "Header"  },
-                  { key: "sidebar", label: "Sidebar" },
-                  { key: "accent",  label: "Accent"  }
-                ].map(zone => (
-                  <div key={zone.key}>
-                    <label className="text-[11.5px] text-ink-600 dark:text-ink-400 block mb-1.5">{zone.label}</label>
-                    <div className="flex items-center gap-2">
-                      <input type="color"
-                             value={(store.settings.palette || {})[zone.key] || "#FFFFFF"}
-                             onChange={e => setPalette({ preset: "custom", [zone.key]: e.target.value })}
-                             className="w-10 h-10 rounded-lg cursor-pointer border border-softline dark:border-ink-800"/>
-                      <input type="text"
-                             value={(store.settings.palette || {})[zone.key] || ""}
-                             onChange={e => setPalette({ preset: "custom", [zone.key]: e.target.value })}
-                             className="flex-1 px-2.5 py-2 text-[12.5px] font-mono rounded-lg"
-                             placeholder="#FFFFFF"/>
-                    </div>
-                  </div>
-                ))}
+              <div className="text-[11.5px] text-ink-500 mb-2 font-semibold uppercase tracking-wider">Custom</div>
+              <div className="flex items-center gap-2 max-w-xs">
+                <input type="color" aria-label="Custom accent colour"
+                       value={(store.settings.palette || {}).accent || "#5765E0"}
+                       onChange={e => setPalette({ preset: "custom", accent: e.target.value })}
+                       className="w-10 h-10 rounded-lg cursor-pointer border border-softline dark:border-ink-800"/>
+                <input type="text" aria-label="Custom accent hex"
+                       value={(store.settings.palette || {}).accent || ""}
+                       onChange={e => setPalette({ preset: "custom", accent: e.target.value })}
+                       className="flex-1 px-2.5 py-2 text-[12.5px] font-mono rounded-lg"
+                       placeholder="#5765E0"/>
               </div>
               {(() => {
-                const pal = store.settings.palette || {};
-                const acc = pal.accent || "#5765E0";
-                // Button legibility: best of white / near-black text on the accent.
+                const acc = (store.settings.palette || {}).accent || "#5765E0";
                 const onAccent = Math.max(contrastRatio(acc, "#FFFFFF") || 0, contrastRatio(acc, "#0F1320") || 0);
-                // Accent used as text on the light card background.
                 const accAsText = contrastRatio(acc, "#FFFFFF") || 0;
                 const warn = onAccent < 4.5 || accAsText < 3;
                 return warn ? (
                   <div role="alert" className="mt-3 p-3 rounded-xl bg-amber2-50 dark:bg-amber2-900/20 border border-amber2-200 dark:border-amber2-900/40 text-[12px] text-amber2-700 dark:text-amber2-300">
-                    <span className="font-semibold">Low contrast.</span> This accent gives only {onAccent.toFixed(1)}:1 on buttons and {accAsText.toFixed(1)}:1 as text — below the WCAG 2.2 AA minimum (4.5:1). A UK public-sector tool must meet AA; please choose a darker or more saturated accent.
+                    <span className="font-semibold">Low contrast.</span> This accent gives only {onAccent.toFixed(1)}:1 on buttons and {accAsText.toFixed(1)}:1 as text — below the WCAG 2.2 AA minimum (4.5:1). A UK public-sector tool must meet AA; pick a darker or more saturated accent.
                   </div>
                 ) : (
-                  <div className="mt-3 text-[11px] text-emerald-600 dark:text-emerald-400">Accent contrast: {onAccent.toFixed(1)}:1 on buttons — meets WCAG AA.</div>
+                  <div className="mt-3 text-[11px] text-emerald-600 dark:text-emerald-400">Accent contrast {onAccent.toFixed(1)}:1 on buttons — meets WCAG AA.</div>
                 );
               })()}
-              <div className="text-[11px] text-ink-500 mt-3">Header runs along the top, sidebar is the left nav, accent drives buttons, active states and charts. Saves automatically.</div>
+              <div className="text-[11px] text-ink-500 mt-3">Only the accent changes — buttons, links, active nav and charts. The header and sidebar keep the default surface so the dashboard stays clean. Saves automatically.</div>
             </div>
           </div>
         </Card>
